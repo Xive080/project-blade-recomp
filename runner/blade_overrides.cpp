@@ -9,6 +9,8 @@
 #include <filesystem>
 #include <iostream>
 
+void bladeStartDevTools(PS2Runtime &runtime); // blade_devtools.cpp
+
 namespace
 {
     // 0x113F40 = sceCdDiskReady(mode) de libcdvd. El ELF no tiene simbolos y el analizador no la reconocio, asi que se
@@ -53,6 +55,7 @@ namespace
     {
         runtime.replaceFunction(0x00113F40u, ovCdDiskReady);
         useDiscImage();
+        bladeStartDevTools(runtime);
     }
 }
 

@@ -39,6 +39,18 @@ Propios:
   guarda los bytes; el stub de `sceMpegGetPicture`, si hay callback NODATA y no hubo demux, los pasa al decodificador
   FFmpeg y, cuando no hay imagen, llama al callback NODATA en el propio hilo (como libmpeg) y reintenta, esperando un
   VSync si la lectura del CD aun no ha llegado.
+- `ps2recomp-gs-texture-direct.patch`: el rasterizador por CPU lee las texturas directamente de la VRAM. Antes copiaba
+  la pagina de 8 KB en una cache que solo se invalidaba con TEXFLUSH (podia quedar obsoleta si el juego subia o
+  dibujaba en esa pagina sin TEXFLUSH) y, con texturas de varias paginas, repetia la copia en cada cambio de pagina: era
+  el mayor coste del rasterizador en el menu (videos de fondo de 640x512 en 40 trozos).
+
+Herramientas propias (sin parche: `runner/blade_devtools.cpp`, solo se activan con variables de entorno):
+- `BLADE_DUMP_FRAMES=carpeta[,cada_N[,desde]]`: guarda en PNG la imagen presentada cada N VSync (`frame_TTTTTT.png`).
+- `BLADE_INPUT="300:START;420+20:CROSS;500:UP,CROSS"`: pulsa botones del mando 1 en VSync concretos
+  (`TICK[+DURACION]:BOTONES`, duracion por defecto 6; tambien `LX=`/`LY=` para el stick izquierdo).
+- `BLADE_DUMP_RAM=carpeta,VSync`: guarda los 32 MB de RAM del EE en ese VSync.
+- `BLADE_EXIT_TICK=N`: cierra el proceso en el VSync N (pruebas sin ventana atendida).
+- Guion que llega hasta el modo historia: `BLADE_INPUT="300:START;400:START;500:START;600:START;700:START;900:CROSS;1050:CROSS;1200:CROSS;2250:CROSS;2400:CROSS"`.
 
 ## Estado (2026-11-10)
 - Traduccion: el analizador detecta 3 334 funciones en el ejecutable (un solo segmento, 0x100000-0x336280). 18 dan error
@@ -81,8 +93,29 @@ Propios:
   corta (`jr $ra` en < 0x100 bytes, sin otros saltos, relleno detras y sin `eret`) y la cierra en su delay slot. Hay
   que regenerar el mapa (`filter_ghidra_map.py build/ghidra/ghidra_map.csv work/game.elf work/ghidra_map.csv`) y el
   codigo.
-- Siguiente punto: sin cuelgues ni funciones que falten en 3 minutos (splash, menu). Falta comprobar en pantalla que las
-  imagenes del video y el menu se ven bien y avanzar por el menu hasta una partida.
+- Hasta donde llega (con el guion de `BLADE_INPUT` de Parches): videos de inicio (SCEE, Criterion, RenderWare, Dolby,
+  patrocinadores), pantalla de titulo "Press START", menu principal, seleccion de partida (la tarjeta de memoria
+  funciona: crea y guarda GAME1 en `mc0`, autoguardado en la ranura 1), un jugador, modo historia, CONTINUE, pantalla de
+  carga "hideaway" limpia y carga del primer nivel (TSSDRV carga los efectos: board, jump, kickflip...). El nivel 3D
+  se dibuja (cielo, suelo, decorado, letrero LOADING) pero la pantalla queda negra: ver Pendiente.
+- El VSync del runtime sale de ciclos EE contados, no del reloj: en este Mac van unos 8-13 VSync por segundo real.
+- Pendiente 1 (nivel negro): cada imagen termina con 20 sprites negros sin textura `rgba=0,0,0,126` con mezcla
+  `ALPHA=0x44` ((Cs-Cd)*As+Cd) sobre la zona 3D: un fundido a negro al 98 % que no avanza en mas de 1 000 VSync
+  (comprobado quitando esos sprites en el GS: debajo esta la escena, con la camara quieta). El juego espera algo antes
+  de abrir el fundido. Candidato: el audio. TSSDRV (servidor RPC 0x701, se ejecuta en el IOP emulado) contesta siempre
+  a la llamada de estado 0x8018 (una por VSync, 384 bytes) con todo ceros desde el menu, y el EE nunca le manda
+  comandos (paquete de 32 bytes, contador a 0 en 0x3176B0); en el nivel, el nombre de flujo que viaja en ese paquete es
+  `L1\E\L1C...` (posible voz o musica de la escena de entrada). Siguiente paso: localizar quien lee esa respuesta y
+  el contador del fundido (buscar en RAM la variable que da el 252 de RenderWare = 126 en el GS).
+- Pendiente 2 (menu corrupto): cada imagen el menu sube el video de fondo (MENUBASE.M2V, 640x512) como 40 trozos CT32
+  de 128x64 en los bloques 1536..6655 y las fuentes detras (hasta ~8032), pero los buffers de pantalla estan en las
+  paginas 160 y 320 (bloques 5120 y 10240) y el Z en la 480 (Z16S, 80 paginas, da la vuelta a 0-47). Los trozos 28-39 y
+  las fuentes caen dentro del buffer de la pagina 160 y se pisan con el dibujo: bloques del video viejos arriba y una
+  banda de basura de fuentes. El hueco libre real son las paginas 48-159. Falta ver por que la cache de texturas de
+  RenderWare no vuelve al principio en el limite (hipotesis: calcula el limite con buffers de 640x256). El intercambio de
+  buffers (`sceGsSwapDBuffDc`) es correcto (igual que la libgraph del juego en 0x101B30).
+- Pendiente 3: rendimiento (rasterizador por CPU: muestreo de texturas y escritura de pixel), y comprobar que se oye
+  el audio de LIBSD/TSSDRV.
 - Metodo tomado de [hctp-recomp](https://github.com/BigDaddyJRich/hctp-recomp) (WWE SmackDown! HCTP con PS2Recomp:
   Ghidra + emotionengine-reloaded + inicios recuperados), que tambien ejecuta los IRX propios del juego.
 - Otras funciones de libcdvd sin nombre en el mismo bloque (0x113070, 0x1132A8, 0x113340, 0x113470, 0x1137D8, 0x113AF0): si

@@ -1,0 +1,24 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_texture_page_cache.h b/ps2xRuntime/include/runtime/gs/gs_texture_page_cache.h
+index 1cb1540..a5621b1 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_texture_page_cache.h
++++ b/ps2xRuntime/include/runtime/gs/gs_texture_page_cache.h
+@@ -19,15 +19,12 @@ namespace GSMem
+ 
+         // byteAddress is the wrapped, swizzled VRAM address. The returned
+         // pointer is valid only until the next miss or invalidation.
++        // Lectura directa de la VRAM. La copia de una sola pagina solo se invalidaba con TEXFLUSH, asi que podia
++        // quedar obsoleta si el juego subia o dibujaba sobre esa pagina sin TEXFLUSH, y con texturas de varias
++        // paginas copiaba 8 KB en cada cambio de pagina (era el mayor coste del rasterizador en AirBlade).
+         const uint8_t* Resolve(const uint8_t* vram, uint32_t byteAddress) noexcept
+         {
+-            const uint32_t pageBase = byteAddress & ~(kPageSize - 1u);
+-            if (m_pageBase != pageBase)
+-            {
+-                std::memcpy(m_bytes.data(), vram + pageBase, kPageSize);
+-                m_pageBase = pageBase;
+-            }
+-            return m_bytes.data() + (byteAddress & (kPageSize - 1u));
++            return vram + byteAddress;
+         }
+ 
+     private:

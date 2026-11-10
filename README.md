@@ -168,6 +168,22 @@ Herramientas propias (sin parche: `runner/blade_devtools.cpp`, solo se activan c
   0x4000 bytes que terminan en `jr $ra` + delay slot (+ relleno) justo antes de la funcion siguiente; recupera 0x232320
   y 0x1E0510 (un `switch` al que apunta 0x2E4DD4). Un barrido de los punteros de los datos a codigo fuera de funciones
   no encuentra mas.
+- Hasta donde llega ahora: la escena de entrada del nivel 1 se dibuja entera (piso con sofa y ciudad, hito 11 al
+  terminar la carga con "X CONTINUE") y la partida empieza: HUD con boost, puntos y tiempo (2:26, baja a 50 VSync por
+  segundo de juego), retrato y barra de dialogo abajo. El mando se lee en la partida: CUADRADO da un truco ("350" en
+  rojo). Sin cuelgues ni hilos muertos hasta el VSync 5300 (hito 12).
+- Pendiente 1 (mundo negro en la partida): desde el VSync ~2650 (fin de la escena) no se ve el mundo ni el personaje,
+  solo el HUD. Traza del GS en la partida: solo abanicos del HUD (tbp 3360/3904/4448) y 86 tiras por imagen sin
+  textura con todos los vertices en (2048,2048) = el centro (ofs 1728,1792 + 320,256), z = 2^24 y q = FLT_MAX
+  (w = 0). Volcado de la memoria de VU1 en un XGKICK de esas tiras: la salida es XYZ `0x8000,0x8000,0x7fffffff` (NaN
+  convertido) y los registros VF tienen NaN; la causa esta antes: la matriz de transformacion del bloque de constantes
+  (qwords 0x3F0-0x3F3, que sube el EE con `UNPACK V4-32 num=13 addr=0x3F0`, codigo VIF `0x6C0D03F0`) llega toda a
+  cero. Los paquetes DMA en RAM (p. ej. 0x33EABC en el VSync 4700) ya traen esas 4 filas a cero (alguna con -0), con el
+  resto de constantes bien (640x512, 2048/2048, 0.75, 635...). Es decir, el EE calcula una matriz camara x proyeccion
+  nula en la partida (en la escena de entrada si sale bien). Siguiente paso: encontrar quien escribe esas 4 filas
+  (buscar el `sq` al buffer DMA del paquete) y seguir hacia atras hasta la matriz de la camara de juego (camara que
+  sigue al jugador); sospechosas: una macro de VU0 / FPU con resultado distinto (p. ej. normalizar un vector cero, o
+  `rsqrt`/`div` con 0) o la posicion del jugador sin iniciar.
 - Pendiente 2 (menu corrupto): cada imagen el menu sube el video de fondo (MENUBASE.M2V, 640x512) como 40 trozos CT32
   de 128x64 en los bloques 1536..6655 y las fuentes detras (hasta ~8032), pero los buffers de pantalla estan en las
   paginas 160 y 320 (bloques 5120 y 10240) y el Z en la 480 (Z16S, 80 paginas, da la vuelta a 0-47). Los trozos 28-39 y

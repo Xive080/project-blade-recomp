@@ -24,6 +24,25 @@ Simbolos, matching y notas del motor (RenderWare): repo hermano `project-blade-d
    `cmake -S runner -B build/blade -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build/blade --target blade_recomp`
 4. `build/blade/blade_recomp disc/SCES_502.46` (el runtime toma la raiz del CD de la carpeta del ELF).
 
+## Controles
+Teclado y ratón hacen de mando 1 (`runner/blade_input.cpp`). Un mando conectado sigue funcionando y se suma.
+
+| PS2 | Teclado / ratón |
+|---|---|
+| Stick izquierdo | W A S D (con Alt, a medias) |
+| Cruceta | flechas |
+| X | Espacio, K, clic izquierdo |
+| Cuadrado | J, clic derecho |
+| Círculo | L, clic central |
+| Triángulo | I, Esc, Retroceso |
+| L1 / R1 | Q / E, rueda arriba / abajo |
+| L2 / R2 | 1 / 3, Mayús izquierda / derecha |
+| L3 / R3 | Z / C |
+| Start / Select | Enter / Tab |
+| Stick derecho | movimiento del ratón (`BLADE_MOUSE_GAIN`, por defecto 6) |
+
+Esc ya no cierra la ventana. `BLADE_KBM=0` lo desactiva; con `BLADE_INPUT` (guion de pruebas) no se activa.
+
 ## Parches sobre PS2Recomp
 Heredados del proyecto hermano de Vampire Night, que usa el mismo runtime:
 - `ps2recomp-mfifo-vif1.patch`: anillo MFIFO de SPR a VIF1 (RBSR/RBOR).

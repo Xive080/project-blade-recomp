@@ -10,6 +10,7 @@
 #include <iostream>
 
 void bladeStartDevTools(PS2Runtime &runtime); // blade_devtools.cpp
+void bladeStartKeyboardMouse(PS2Runtime &runtime); // blade_input.cpp
 
 namespace
 {
@@ -56,6 +57,7 @@ namespace
         runtime.replaceFunction(0x00113F40u, ovCdDiskReady);
         useDiscImage();
         bladeStartDevTools(runtime);
+        bladeStartKeyboardMouse(runtime);
     }
 }
 

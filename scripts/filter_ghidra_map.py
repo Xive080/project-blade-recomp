@@ -72,11 +72,24 @@ def plausible(t):
 cands = {skip_pad(int(r['Start'], 16)) for r in rows if label.match(r['Name'])}
 added = sorted(t for t in cands if t not in funcs and not inside(t) and plausible(t))
 
+def short_leaf(t):
+    # `jr $ra` en menos de 0x100 bytes, sin otro salto antes, y relleno de nops detras del delay slot
+    for a in range(t, t + 0x100, 4):
+        w = word(a)
+        if w is None or w == 0x42000018:  # eret: codigo de kernel
+            return None
+        if w == 0x03E00008:
+            return a + 8 if word(a + 8) == 0 else None
+        if w >> 26 in (2, 3) or (w >> 26 == 0 and (w & 0x3F) in (8, 9)):
+            return None
+    return None
+
 # 3. Codigo en huecos pequenos entre funciones que Ghidra no asigno a ninguna (p. ej. 0x1DB030: detras de un `j` de
 #    cola + delay slot y solo alcanzable por puntero). El primer word no nulo del hueco es un inicio.
 known = sorted(set(funcs) | set(added))
 ends = {s: funcs[s][1] for s in funcs}
 gaps = []
+leaf_end = {}
 for i, s in enumerate(known[:-1]):
     e = ends.get(s)
     if e is None:
@@ -86,14 +99,20 @@ for i, s in enumerate(known[:-1]):
         t += 4
     if t < known[i + 1] and known[i + 1] - t <= 0x400 and not inside(t):
         gaps.append(t)
+    elif t < known[i + 1] and not inside(t) and plausible(t) and short_leaf(t):
+        # Hueco grande (datos detras): solo una hoja corta pegada al final de la funcion anterior, p. ej. 0x260FE0
+        # (ultima del texto, llamada por puntero desde 0x24D040). Termina en su `jr $ra` + delay slot.
+        gaps.append(t)
+        leaf_end[t] = short_leaf(t)
 added = sorted(set(added) | set(gaps))
+
 
 # 4. Dentro de los rangos recuperados: `jr $ra` + delay slot + relleno de nops => lo siguiente es otra funcion
 #    (entry_00219830 de Ghidra cubre el final de una funcion, el relleno y la funcion 0x219840, llamada por puntero).
 starts = sorted(set(funcs) | set(added))
 split = []
 for i, s0 in enumerate(starts):
-    if s0 in funcs:
+    if s0 in funcs or s0 in leaf_end:
         continue
     e = starts[i + 1] if i + 1 < len(starts) else hi
     t = s0
@@ -117,6 +136,6 @@ with open(dst, 'w') as out:
         if s in funcs:
             name, end = funcs[s]
         else:
-            name, end = f'FUN_{s:08x}', nxt[s]
+            name, end = f'FUN_{s:08x}', leaf_end.get(s, nxt[s])
         out.write(f'{name},0x{s:08X},0x{end:08X},{end - s}\n')
 print(f'{len(rows)} filas -> {len(funcs)} funciones + {len(added)} inicios recuperados ({len(gaps)} de huecos, {len(split)} tras relleno) ({", ".join(f"{a:#x}" for a in added[:6])}...)')

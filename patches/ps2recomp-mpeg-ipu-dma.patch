@@ -1,0 +1,479 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index 48b1bb1..3bb68ca 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -331,6 +331,12 @@ public:
+     uint8_t *getVU0Data() { return m_vu0Data; }
+     const uint8_t *getVU0Data() const { return m_vu0Data; }
+ 
++    // DMA canal 4 (toIPU): los bytes que el juego manda al IPU se guardan aqui para que
++    // el HLE de sceMpeg los decodifique (solo mientras la captura este activa).
++    void setIpuInputCapture(bool enabled);
++    size_t takeIpuInput(std::vector<uint8_t> &out);
++    void clearIpuInput();
++
+     bool isPath3Masked() const { return m_path3Masked; }
+     void flushMaskedPath3Packets(bool drainImmediately = true);
+ 
+@@ -423,6 +429,10 @@ public:
+     std::vector<PendingTransfer> m_pendingVif1Transfers;
+     std::mutex m_completedDmacMutex;
+     std::vector<uint32_t> m_completedDmacCauses;
++    std::mutex m_ipuInputMutex;
++    std::vector<uint8_t> m_ipuInput;
++    bool m_ipuInputCapture = false;
++    void processIpuToDma(uint32_t chcr);
+ 
+     struct CodeRegion
+     {
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+index 44eaef4..ca741ab 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+@@ -512,6 +512,11 @@ namespace ps2_stubs
+             uint64_t presentationEndTickQ32 = std::numeric_limits<uint64_t>::max();
+             int64_t firstPresentedPts90k = -1;
+             uint64_t ptsPresentationBaseTickQ32 = 0u;
++            // Datos por sceMpegDemuxPss*/sceMpegAddBs: no se usa el camino IPU.
++            bool demuxFed = false;
++            // Camino IPU: el juego alimenta el IPU por DMA canal 4 desde el callback NODATA.
++            bool ipuFed = false;
++            uint32_t ipuIdleRounds = 0u;
+         };
+ 
+         struct MpegStreamCallbackEvent
+@@ -1178,6 +1183,7 @@ namespace ps2_stubs
+                               bool finalChunk = false)
+         {
+             std::vector<uint8_t> &buffer = playback.pssBuffer;
++            playback.demuxFed = true;
+ 
+             while (true)
+             {
+@@ -1652,6 +1658,44 @@ namespace ps2_stubs
+             dispatchStreamCallbacks(rdram, ctx, runtime, events);
+         }
+ 
++        constexpr uint32_t kMpegCbNodata = 1u;
++        // Rondas seguidas del callback NODATA sin datos nuevos antes de devolver sin imagen.
++        constexpr uint32_t kMaxIpuIdleRounds = 30u;
++
++        MpegRegisteredCallback findNodataCallbackUnlocked(uint32_t mpegAddr)
++        {
++            auto it = g_mpeg_stub_state.callbacksByMpeg.find(mpegAddr);
++            if (it != g_mpeg_stub_state.callbacksByMpeg.end())
++            {
++                for (const MpegRegisteredCallback &callback : it->second)
++                {
++                    if (!callback.stream && callback.type == kMpegCbNodata && callback.func != 0u)
++                    {
++                        return callback;
++                    }
++                }
++            }
++            return MpegRegisteredCallback{};
++        }
++
++        // Pasa al decodificador lo que el juego haya mandado al IPU por DMA canal 4.
++        size_t drainIpuInputUnlocked(PS2Runtime *runtime, MpegPlaybackState &playback)
++        {
++            if (!runtime)
++            {
++                return 0u;
++            }
++            std::vector<uint8_t> input;
++            const size_t size = runtime->memory().takeIpuInput(input);
++            if (size == 0u)
++            {
++                return 0u;
++            }
++            playback.ipuFed = true;
++            feedElementaryStream(playback, input.data(), input.size());
++            return size;
++        }
++
+         void writeBlankMpegFrame(uint8_t *rdram, uint32_t destAddr, uint32_t width, uint32_t height)
+         {
+             if (!rdram || destAddr == 0u)
+@@ -1884,6 +1928,7 @@ namespace ps2_stubs
+         {
+             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
++            playback.demuxFed = true;
+             const size_t framesBefore = playback.decodedFrames.size();
+             while (copied < byteCount)
+             {
+@@ -1911,7 +1956,6 @@ namespace ps2_stubs
+     void sceMpegAddCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         (void)rdram;
+-        (void)runtime;
+ 
+         const uint32_t mpegAddr = getRegU32(ctx, 4);
+         const uint32_t callbackType = getRegU32(ctx, 5);
+@@ -1925,6 +1969,10 @@ namespace ps2_stubs
+         const uint32_t handle = g_mpeg_stub_state.nextCallbackHandle++;
+         g_mpeg_stub_state.callbacksByMpeg[mpegAddr].push_back(
+             MpegRegisteredCallback{callbackType, 0u, callbackFunc, callbackData, handle, false});
++        if (callbackType == kMpegCbNodata && runtime)
++        {
++            runtime->memory().setIpuInputCapture(true);
++        }
+ 
+         setReturnU32(ctx, handle);
+     }
+@@ -2002,6 +2050,10 @@ namespace ps2_stubs
+             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+             getPlaybackState(param_1) = makeFreshPlaybackState();
+         }
++        if (runtime)
++        {
++            runtime->memory().clearIpuInput();
++        }
+ 
+         const uint32_t puVar4 = uVar3 + 0x108u;
+         const uint32_t innerSize = static_cast<uint32_t>(iVar2_signed) - 0x118u;
+@@ -2280,6 +2332,65 @@ namespace ps2_stubs
+         setReturnU32(ctx, getPlaybackState(mpegAddr).decodeMode);
+     }
+ 
++    [[noreturn]] static void invokeMpegNodataCallback(uint8_t *rdram,
++                                                      R5900Context *ctx,
++                                                      PS2Runtime *runtime,
++                                                      uint32_t mpegAddr,
++                                                      const MpegRegisteredCallback &callback)
++    {
++        EeScheduler &scheduler = runtime->eeScheduler();
++        const uint32_t cbDataAddr = runtime->guestMalloc(kMpegCallbackDataSize, 16u);
++        if (cbDataAddr != 0u)
++        {
++            if (uint8_t *data = getMemPtr(rdram, cbDataAddr))
++            {
++                std::memset(data, 0, kMpegCallbackDataSize);
++                *reinterpret_cast<uint32_t *>(data) = kMpegCbNodata;
++            }
++        }
++
++        GuestInvocation invocation{};
++        invocation.kind = GuestInvocationKind::HleCall;
++        invocation.context = *ctx;
++        invocation.context.pc = callback.func;
++        SET_GPR_U32(&invocation.context, 4, mpegAddr);
++        SET_GPR_U32(&invocation.context, 5, cbDataAddr);
++        SET_GPR_U32(&invocation.context, 6, callback.data);
++        SET_GPR_U32(&invocation.context, 7, 0u);
++        SET_GPR_U32(&invocation.context, 29, 0u);
++        SET_GPR_U32(&invocation.context, 31, 0u);
++        invocation.onComplete = [rdram, runtime, mpegAddr, cbDataAddr](const R5900Context &, R5900Context &parent)
++        {
++            if (cbDataAddr != 0u)
++            {
++                runtime->guestFree(cbDataAddr);
++            }
++            bool progressed = false;
++            {
++                std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
++                MpegPlaybackState &playback = getPlaybackState(mpegAddr);
++                const size_t fed = drainIpuInputUnlocked(runtime, playback);
++                if (playback.decodedFrames.empty() && fed == 0u && playback.sawSequenceEnd && playback.decoder)
++                {
++                    // Fin del video (sequence_end_code) sin mas datos: vaciar el decodificador.
++                    playback.decoder->flush(playback.decodedFrames);
++                    playback.streamEnded = true;
++                }
++                progressed = fed != 0u || !playback.decodedFrames.empty() || playback.streamEnded;
++                playback.ipuIdleRounds = progressed ? 0u : playback.ipuIdleRounds + 1u;
++            }
++            if (!progressed)
++            {
++                // Lectura de CD en curso: esperar un VSync y volver a pedir datos.
++                EeScheduler &ee = runtime->eeScheduler();
++                ee.waitVSync(ee.currentVSyncTick(), -1, [rdram, runtime](R5900Context &resumeContext)
++                             { sceMpegGetPicture(rdram, &resumeContext, runtime); });
++            }
++            sceMpegGetPicture(rdram, &parent, runtime);
++        };
++        scheduler.invokeCurrent(std::move(invocation));
++    }
++
+     void sceMpegGetPicture(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         const uint32_t mpegAddr = getRegU32(ctx, 4);
+@@ -2292,7 +2403,27 @@ namespace ps2_stubs
+         {
+             std::unique_lock<std::mutex> lock(g_mpeg_stub_mutex);
+             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+-            if (playback.decodedFrames.empty() &&
++            const MpegRegisteredCallback nodata = findNodataCallbackUnlocked(mpegAddr);
++            if (!playback.demuxFed && nodata.func != 0u && runtime && runtime->hasFunction(nodata.func))
++            {
++                // El juego no da datos por la API: los manda al IPU por DMA canal 4 desde su
++                // callback NODATA, que libmpeg llama cuando al IPU le faltan datos.
++                drainIpuInputUnlocked(runtime, playback);
++                if (playback.decodedFrames.empty() && !playback.streamEnded && !playback.decoderFailed)
++                {
++                    if (playback.ipuIdleRounds >= kMaxIpuIdleRounds)
++                    {
++                        // Sin datos nuevos: se devuelve sin imagen para que el juego mire sus banderas.
++                        playback.ipuIdleRounds = 0u;
++                    }
++                    else
++                    {
++                        lock.unlock();
++                        invokeMpegNodataCallback(rdram, ctx, runtime, mpegAddr, nodata);
++                    }
++                }
++            }
++            else if (playback.decodedFrames.empty() &&
+                 !g_mpeg_stub_state.currentCdStreamEofSeen &&
+                 !playback.streamEnded &&
+                 !playback.decoderFailed)
+@@ -2459,8 +2590,9 @@ namespace ps2_stubs
+         // be observed while more PSS data is still buffered, and a decoder
+         // failure before producer EOF may still recover on a later sequence.
+         const bool producerEnded =
+-            g_mpeg_stub_state.currentCdStreamEofSeen &&
+-            playback.cdStreamGeneration == g_mpeg_stub_state.cdStreamGeneration;
++            (g_mpeg_stub_state.currentCdStreamEofSeen &&
++             playback.cdStreamGeneration == g_mpeg_stub_state.cdStreamGeneration) ||
++            (playback.ipuFed && playback.streamEnded);
+         const bool ended = producerEnded &&
+                            (playback.streamEnded || (playback.decoderFailed && playback.sawInput));
+         const uint64_t presentationEnd = playback.presentationEndTickQ32;
+@@ -2501,13 +2633,20 @@ namespace ps2_stubs
+ 
+     void sceMpegReset(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+-        (void)runtime;
+         const uint32_t param_1 = getRegU32(ctx, 4);
+         {
+             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+             MpegPlaybackState &playback = getPlaybackState(param_1);
+             MpegPlaybackState resetState = makeFreshPlaybackStatePreservingConfig(playback);
+-            if (playback.streamEnded || playback.decoderFailed)
++            if (playback.ipuFed)
++            {
++                // Camino IPU: el juego rearma su anillo y vuelve a empezar (otro video o bucle).
++                if (runtime)
++                {
++                    runtime->memory().clearIpuInput();
++                }
++            }
++            else if (playback.streamEnded || playback.decoderFailed)
+             {
+                 resetState.sawInput = true;
+                 resetState.streamEnded = true;
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 2bd5e05..fec7b0b 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1306,6 +1306,12 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
+             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
+ 
++            if (channelBase == 0x1000B400u)
++            {
++                processIpuToDma(value);
++                return true;
++            }
++
+             if (tryProcessScratchpadDma(channelBase, value))
+             {
+                 return true;
+@@ -2025,6 +2031,196 @@ std::vector<uint32_t> PS2Memory::consumeCompletedDmacCauses()
+     return causes;
+ }
+ 
++void PS2Memory::setIpuInputCapture(bool enabled)
++{
++    std::lock_guard<std::mutex> lock(m_ipuInputMutex);
++    m_ipuInputCapture = enabled;
++    if (!enabled)
++        m_ipuInput.clear();
++}
++
++size_t PS2Memory::takeIpuInput(std::vector<uint8_t> &out)
++{
++    std::lock_guard<std::mutex> lock(m_ipuInputMutex);
++    out.clear();
++    out.swap(m_ipuInput);
++    return out.size();
++}
++
++void PS2Memory::clearIpuInput()
++{
++    std::lock_guard<std::mutex> lock(m_ipuInputMutex);
++    m_ipuInput.clear();
++}
++
++// DMA canal 4 (memoria -> IPU). Se completa en el acto: recorre la cadena de tags (o el bloque
++// MADR/QWC en modo normal), deja MADR/TADR/QWC/CHCR como los dejaria el DMAC al acabar
++// (las rutinas tipo vibuf calculan lo consumido con D4_MADR) y entrega los bytes al HLE de sceMpeg.
++void PS2Memory::processIpuToDma(uint32_t chcr)
++{
++    static constexpr uint32_t kBase = 0x1000B400u;
++    static constexpr uint32_t kDStat = 0x1000E010u;
++    static constexpr uint32_t kIpuToChannel = 4u;
++    static constexpr int kMaxChainTags = 4096;
++
++    uint32_t madr = m_ioRegisters[kBase + 0x10u];
++    uint32_t qwc = m_ioRegisters[kBase + 0x20u] & 0xFFFFu;
++    uint32_t tadr = m_ioRegisters[kBase + 0x30u];
++    uint32_t asr0 = m_ioRegisters[kBase + 0x40u];
++    uint32_t asr1 = m_ioRegisters[kBase + 0x50u];
++    uint32_t asp = (chcr >> 4) & 0x3u;
++    const uint32_t mode = (chcr >> 2) & 0x3u;
++    const bool tieEnabled = (chcr & (1u << 7)) != 0u;
++    uint32_t tagUpper = (chcr >> 16) & 0xFFFFu;
++
++    std::vector<uint8_t> data;
++    auto append = [&](uint32_t srcAddr, uint32_t qwCount)
++    {
++        const bool spr = (srcAddr & 0x80000000u) != 0u || isScratchpad(srcAddr);
++        const uint8_t *base = spr ? m_scratchpad : m_rdram;
++        const uint32_t size = spr ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
++        uint32_t src = spr ? (srcAddr & (PS2_SCRATCHPAD_SIZE - 1u)) : (translateAddress(srcAddr & 0x7FFFFFFFu) & PS2_RAM_MASK);
++        uint64_t bytes = static_cast<uint64_t>(qwCount) * 16u;
++        while (bytes > 0u && base != nullptr)
++        {
++            if (src >= size)
++                src = 0u;
++            const uint32_t chunk = static_cast<uint32_t>(std::min<uint64_t>(bytes, size - src));
++            data.insert(data.end(), base + src, base + src + chunk);
++            bytes -= chunk;
++            src += chunk;
++        }
++    };
++
++    // Resto de una transferencia parada a medias (QWC > 0).
++    bool endChain = (mode != 1u);
++    if (qwc > 0u)
++    {
++        append(madr, qwc);
++        madr += qwc * 16u;
++        qwc = 0u;
++        const uint32_t id = (tagUpper >> 12) & 0x7u;
++        if (id == 0u || id == 7u || (tieEnabled && (tagUpper & 0x8000u) != 0u))
++            endChain = true;
++    }
++
++    int tags = 0;
++    while (!endChain && tags < kMaxChainTags)
++    {
++        const bool tagSpr = (tadr & 0x80000000u) != 0u || isScratchpad(tadr);
++        const uint8_t *tagBase = tagSpr ? m_scratchpad : m_rdram;
++        const uint32_t tagSize = tagSpr ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
++        const uint32_t tagPhys = tagSpr ? (tadr & (PS2_SCRATCHPAD_SIZE - 1u)) : (translateAddress(tadr & 0x7FFFFFFFu) & PS2_RAM_MASK);
++        if (tagBase == nullptr || tagPhys + 16u > tagSize)
++            break;
++        uint64_t tag = 0;
++        std::memcpy(&tag, tagBase + tagPhys, sizeof(tag));
++        ++tags;
++
++        const uint32_t tagQwc = static_cast<uint32_t>(tag & 0xFFFFu);
++        const uint32_t id = static_cast<uint32_t>((tag >> 28) & 0x7u);
++        const bool irq = ((tag >> 31) & 0x1u) != 0u;
++        const uint32_t addr = static_cast<uint32_t>((tag >> 32) & 0x7FFFFFF0u);
++        tagUpper = static_cast<uint32_t>((tag >> 16) & 0xFFFFu);
++
++        uint32_t dataAddr = 0u;
++        switch (id)
++        {
++        case 0: // refe
++            dataAddr = addr;
++            tadr += 16u;
++            endChain = true;
++            break;
++        case 1: // cnt
++            dataAddr = tadr + 16u;
++            tadr = dataAddr + tagQwc * 16u;
++            break;
++        case 2: // next
++            dataAddr = tadr + 16u;
++            tadr = addr;
++            break;
++        case 3: // ref
++        case 4: // refs
++            dataAddr = addr;
++            tadr += 16u;
++            break;
++        case 5: // call
++            dataAddr = tadr + 16u;
++            if (asp == 0u)
++                asr0 = dataAddr + tagQwc * 16u;
++            else
++                asr1 = dataAddr + tagQwc * 16u;
++            asp = std::min<uint32_t>(asp + 1u, 2u);
++            tadr = addr;
++            break;
++        case 6: // ret
++            dataAddr = tadr + 16u;
++            if (asp == 2u)
++            {
++                tadr = asr1;
++                asp = 1u;
++            }
++            else if (asp == 1u)
++            {
++                tadr = asr0;
++                asp = 0u;
++            }
++            else
++            {
++                endChain = true;
++            }
++            break;
++        default: // end
++            dataAddr = tadr + 16u;
++            endChain = true;
++            break;
++        }
++
++        if (tagQwc > 0u)
++            append(dataAddr, tagQwc);
++        madr = dataAddr + tagQwc * 16u;
++        if (irq && tieEnabled)
++            endChain = true;
++    }
++
++    m_ioRegisters[kBase + 0x10u] = madr;
++    m_ioRegisters[kBase + 0x20u] = 0u;
++    m_ioRegisters[kBase + 0x30u] = tadr;
++    m_ioRegisters[kBase + 0x40u] = asr0;
++    m_ioRegisters[kBase + 0x50u] = asr1;
++    uint32_t doneChcr = (chcr & 0x0000FFCFu & ~0x100u) | ((asp & 0x3u) << 4);
++    if (mode == 1u)
++        doneChcr |= tagUpper << 16;
++    m_ioRegisters[kBase] = doneChcr;
++
++    uint32_t dstat = m_ioRegisters.count(kDStat) ? m_ioRegisters[kDStat] : 0u;
++    dstat |= (1u << kIpuToChannel);
++    if (((dstat & 0x3FFu) & ((dstat >> 16) & 0x3FFu)) != 0u)
++        dstat |= (1u << 31);
++    m_ioRegisters[kDStat] = dstat;
++    queueCompletedDmacCause(kIpuToChannel);
++
++    static uint32_t s_ipuDmaLogCount = 0u;
++    if (s_ipuDmaLogCount < 16u)
++    {
++        ++s_ipuDmaLogCount;
++        PS2_IF_AGRESSIVE_LOGS({
++            std::cerr << "[IPU:toDMA] chcr=0x" << std::hex << chcr << " madr=0x" << madr << " tadr=0x" << tadr
++                      << std::dec << " tags=" << tags << " bytes=" << data.size() << std::endl;
++        });
++    }
++
++    if (data.empty())
++        return;
++    std::lock_guard<std::mutex> lock(m_ipuInputMutex);
++    if (!m_ipuInputCapture)
++        return;
++    constexpr size_t kMaxIpuInputBytes = 32u * 1024u * 1024u;
++    if (m_ipuInput.size() + data.size() > kMaxIpuInputBytes)
++        m_ipuInput.clear();
++    m_ipuInput.insert(m_ipuInput.end(), data.begin(), data.end());
++}
++
+ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
+ {
+     if (m_path3Masked || m_path3MaskedFifo.empty())

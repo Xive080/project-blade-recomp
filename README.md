@@ -32,6 +32,13 @@ Heredados del proyecto hermano de Vampire Night, que usa el mismo runtime:
 Propios:
 - `ps2recomp-pad-reqstate-busy.patch`: en los stubs de libpad, cada peticion (`PortOpen`, `SetMainMode`,
   `SetActAlign`...) queda en BUSY y `scePadGetReqState` la ve BUSY una vez antes de completarla, como en la consola.
+- `ps2recomp-mpeg-ipu-dma.patch`: videos alimentados por DMA al IPU. El juego no da datos a sceMpeg por la API
+  (`sceMpegDemuxPss`/`AddBs`): registra el callback NODATA (0x172600) y alimenta el IPU por el canal 4 (toIPU) desde un
+  anillo de bloques de 32 KB con tags `ref`/`refe` (rutinas tipo `vibuf` de las muestras de Sony, 0x1B3610-0x1B4290). El
+  parche completa en el acto el DMA del canal 4 (modo normal o cadena: MADR/QWC/TADR/CHCR como al acabar, D_STAT.CIS4) y
+  guarda los bytes; el stub de `sceMpegGetPicture`, si hay callback NODATA y no hubo demux, los pasa al decodificador
+  FFmpeg y, cuando no hay imagen, llama al callback NODATA en el propio hilo (como libmpeg) y reintenta, esperando un
+  VSync si la lectura del CD aun no ha llegado.
 
 ## Estado (2026-11-10)
 - Traduccion: el analizador detecta 3 334 funciones en el ejecutable (un solo segmento, 0x100000-0x336280). 18 dan error
@@ -61,8 +68,21 @@ Propios:
   `GTFSCDVD.IRX` (servidor RPC `0x475453`) al acabar una lectura. Ese modulo lee por LSN del disco original
   (0x1E391C...) y el ISO virtual que el IOP arma desde la carpeta extraida tiene otros LSN, asi que cada `sceCdRead`
   fallaba y se reintentaba sin fin. `blade_overrides.cpp` usa la imagen del disco (`game.iso`/`BLADE_ISO`).
-- Con eso las lecturas se completan y el juego manda cientos de paquetes al GIF. Siguiente punto: un video (`sceMpeg`),
-  que sin FFmpeg se queda esperando frames; el runner activa FFmpeg si lo encuentra.
+- Con eso las lecturas se completan y el juego manda cientos de paquetes al GIF hasta llegar al primer video (`sceMpeg`).
+- Bloqueo 5 (resuelto): el hilo principal esperaba en `sceMpegGetPicture` (0x107E08, llamada desde 0x171E94) aun con
+  FFmpeg. El juego no usa `sceMpegDemuxPss`/`AddBs`: lee `MPEG/*.M2V` (video elemental, sin PSS) a un anillo de bloques
+  de 32 KB y lo manda al IPU por DMA canal 4 desde su callback NODATA (0x172600), que solo llama libmpeg. Ni el canal 4
+  ni ese callback existian en el runtime. Parche `ps2recomp-mpeg-ipu-dma.patch` (ver Parches). Con eso SPLASH.M2V se
+  decodifica a 640x512 a su ritmo (una imagen cada 2 VSync), termina, y el juego arranca un segundo video (por tamano y momento, MENUBASE.M2V, fondo del menu; sin confirmar);
+  con START (tecla Enter) salta el video de inicio, asi que lee el mando.
+- Bloqueo 6 (resuelto): `jalr` a 0x260FE0 (desde 0x24D040, tabla de metodos) sin funcion. Es una hoja de 0x34 bytes, la
+  ultima del texto, pegada al `jr $ra` de 0x260F70 y con datos detras; Ghidra no la crea y el hueco hasta la siguiente
+  funcion es demasiado grande para el paso 3 del filtro. `filter_ghidra_map.py` acepta ahora en huecos grandes una hoja
+  corta (`jr $ra` en < 0x100 bytes, sin otros saltos, relleno detras y sin `eret`) y la cierra en su delay slot. Hay
+  que regenerar el mapa (`filter_ghidra_map.py build/ghidra/ghidra_map.csv work/game.elf work/ghidra_map.csv`) y el
+  codigo.
+- Siguiente punto: sin cuelgues ni funciones que falten en 3 minutos (splash, menu). Falta comprobar en pantalla que las
+  imagenes del video y el menu se ven bien y avanzar por el menu hasta una partida.
 - Metodo tomado de [hctp-recomp](https://github.com/BigDaddyJRich/hctp-recomp) (WWE SmackDown! HCTP con PS2Recomp:
   Ghidra + emotionengine-reloaded + inicios recuperados), que tambien ejecuta los IRX propios del juego.
 - Otras funciones de libcdvd sin nombre en el mismo bloque (0x113070, 0x1132A8, 0x113340, 0x113470, 0x1137D8, 0x113AF0): si

@@ -7,6 +7,8 @@
 //                                        Mientras el guion tiene pasos pendientes el teclado no cuenta; al acabar se suelta.
 //   BLADE_DUMP_RAM=carpeta,VSync[,VSync...] guarda la RAM del EE (32 MB) en carpeta/ram_VSync.bin al llegar a cada VSync.
 //   BLADE_EXIT_TICK=N                    cierra el proceso al llegar al VSync N (para pruebas sin ventana atendida).
+//   BLADE_HIDDEN=1                       crea la ventana oculta y sin foco (pruebas en segundo plano; los volcados
+//                                        de marcos siguen funcionando porque leen la imagen del GS, no la ventana).
 // Leen el marco ya presentado (GS::copyLatchedHostPresentationFrame, protegido por su mutex) y usan el estado forzado
 // de libpad (setPadOverrideState), asi que no tocan el runtime.
 #include "ps2_runtime.h"
@@ -35,13 +37,29 @@ namespace ps2_stubs
 
 namespace
 {
+    // Se evalua antes de main: SetConfigFlags solo anade banderas que InitWindow lee despues (el runtime anade
+    // FLAG_WINDOW_RESIZABLE con otra llamada, que no borra estas).
+    const bool kHiddenWindow = []()
+    {
+        const char *env = std::getenv("BLADE_HIDDEN");
+        if (!env || !*env || *env == '0')
+            return false;
+        SetConfigFlags(FLAG_WINDOW_HIDDEN | FLAG_WINDOW_UNFOCUSED);
+        return true;
+    }();
+
     struct InputStep
     {
         uint64_t start = 0;
         uint64_t end = 0;  // exclusivo
         uint16_t mask = 0; // bits activos (1 = pulsado)
         int lx = -1, ly = -1;
+        // momento (reloj del anfitrion) en que se activo: un paso dura al menos kMinHoldMs aunque los VSync corran
+        // mas que el sondeo (con el EE ocioso el tiempo avanza a saltos y el juego podria no ver la pulsacion)
+        std::chrono::steady_clock::time_point since{};
+        bool seen = false;
     };
+    constexpr auto kMinHoldMs = std::chrono::milliseconds(150);
 
     uint16_t buttonBit(const std::string &name)
     {
@@ -117,6 +135,25 @@ namespace
         ExportImage(img, (dir / name).string().c_str());
     }
 
+    // estado de los hilos y semaforos del EE (con el volcado de RAM: sp sirve para recorrer la pila a mano)
+    void printKernel(PS2Runtime &rt, uint64_t tick)
+    {
+        static const char *kStatus[] = {"run", "ready", "wait", "waitsusp", "susp", "dormant"};
+        static const char *kWait[] = {"-", "sleep", "sema", "evflag", "vsync", "ext", "mpeg"};
+        const EeKernelSnapshot snap = rt.eeScheduler().snapshot();
+        std::printf("[blade:kernel] VSync %llu, hilo en curso %d\n", static_cast<unsigned long long>(tick),
+                    snap.runningThreadId);
+        for (const EeThreadSnapshot &t : snap.threads)
+            std::printf("[blade:kernel]  hilo %d entry=%08x pc=%08x ra=%08x sp=%08x prio=%d %s %s %d\n", t.id, t.entry,
+                        t.pc, t.ra, t.sp, t.currentPriority, kStatus[static_cast<int>(t.status) % 6],
+                        kWait[static_cast<int>(t.waitReason) % 7], t.waitId);
+        for (const EeSemaphoreSnapshot &s : snap.semaphores)
+            std::printf("[blade:kernel]  sema %d count=%d max=%d waiters=%u\n", s.id, s.count, s.maxCount, s.waiters);
+        for (const EeEventFlagSnapshot &e : snap.eventFlags)
+            std::printf("[blade:kernel]  evflag %d bits=%08x waiters=%u\n", e.id, e.bits, e.waiters);
+        std::fflush(stdout);
+    }
+
     void devLoop(PS2Runtime *rt, std::filesystem::path dumpDir, uint64_t dumpEvery, uint64_t dumpFrom, std::vector<InputStep> steps,
                  uint64_t exitTick, std::filesystem::path ramDir, std::vector<uint64_t> ramTicks)
     {
@@ -128,19 +165,31 @@ namespace
                                                                       { return a.end < b.end; })->end;
         for (;;)
         {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            std::this_thread::sleep_for(std::chrono::microseconds(250));
             const uint64_t tick = rt->eeScheduler().currentVSyncTick();
-            if (tick == last)
+            const auto now = std::chrono::steady_clock::now();
+            bool holding = false;
+            for (InputStep &s : steps)
+            {
+                if (tick >= s.start && !s.seen)
+                {
+                    s.seen = true;
+                    s.since = now;
+                }
+                holding = holding || (s.seen && now - s.since < kMinHoldMs);
+            }
+            if (tick == last && !holding)
                 continue;
+            const uint64_t previous = last;
             last = tick;
             if (!steps.empty())
             {
-                if (tick < lastStepEnd)
+                if (tick < lastStepEnd || holding)
                 {
                     uint16_t mask = 0;
                     uint8_t lx = 0x80, ly = 0x80;
                     for (const InputStep &s : steps)
-                        if (tick >= s.start && tick < s.end)
+                        if (s.seen && (tick < s.end || now - s.since < kMinHoldMs))
                         {
                             mask |= s.mask;
                             if (s.lx >= 0) lx = static_cast<uint8_t>(s.lx);
@@ -157,7 +206,9 @@ namespace
                 }
             }
             // el marco presentado se fija en el hilo de la ventana al cambiar de VSync: se lee uno despues
-            if (!dumpDir.empty() && tick > dumpFrom && (tick % dumpEvery) == (1u % dumpEvery))
+            // (si los VSync corren mas que el sondeo, se guarda al cruzar cada multiplo de N)
+            if (!dumpDir.empty() && tick > dumpFrom && tick != previous &&
+                (previous == ~0ull || (tick - 1u) / dumpEvery != (previous - 1u) / dumpEvery))
                 writeFrame(dumpDir, tick - 1u, *rt);
             if (!ramTicks.empty() && tick >= ramTicks.front() && !ramDir.empty())
             {
@@ -169,6 +220,7 @@ namespace
                     std::fclose(f);
                     std::cout << "[blade] RAM guardada en VSync " << tick << std::endl;
                 }
+                printKernel(*rt, tick);
                 ramTicks.erase(ramTicks.begin());
             }
             if (exitTick && tick >= exitTick)

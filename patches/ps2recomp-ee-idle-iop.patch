@@ -1,0 +1,34 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index c5e31c4..f05d0b6 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -2036,6 +2036,29 @@ void EeScheduler::waitForEvent()
+         }
+     }
+ 
++    // Con el EE parado, el IOP solo avanzaba al llegar el siguiente plazo (normalmente el VSync): una peticion al IOP
++    // (lectura de CD, RPC) que se completa en microsegundos tardaba un VSync entero. Se adelanta el tiempo en pasos
++    // cortos y se vuelve en cuanto el IOP despierta algo en el EE (evento, invocacion SIF, hilo listo, temporizador).
++    lock.unlock();
++    constexpr uint64_t kIdleStepCycles = 32768u;
++    while (deadlineCycle > m_eeCycle + kIdleStepCycles)
++    {
++        accountCycles(static_cast<uint32_t>(kIdleStepCycles));
++        bool wake = !m_pendingInvocations.empty() || m_pendingEeTimerInterrupts != 0u;
++        for (const auto &queue : m_readyQueues)
++            wake = wake || !queue.empty();
++        {
++            std::lock_guard eventLock(m_eventMutex);
++            wake = wake || !m_events.empty() || m_stopRequested.load(std::memory_order_acquire);
++        }
++        if (wake)
++        {
++            m_checkpointPending.store(true, std::memory_order_release);
++            return;
++        }
++    }
++    lock.lock();
++
+     const bool signaled = m_eventCv.wait_until(lock, hostDeadline, [this]()
+                                                { return !m_events.empty() ||
+                                                         m_stopRequested.load(std::memory_order_acquire); });

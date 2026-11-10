@@ -72,13 +72,29 @@ Propios:
     arrancan y paran voces y el tono (PITCH) avanza NAX segun el reloj del IOP (48 kHz, 28 muestras por bloque de 16
     bytes). ENVX vale 0x7FFF con la voz activa y 0 al acabar. No mezcla audio: sirve para que el driver vea avanzar la
     reproduccion (posicion de los flujos via `sceSdGetAddr`, fin de los efectos).
+- `ps2recomp-perf-gs-vu1.patch`: rendimiento del GS por CPU y del VU1 sin cambiar la imagen. El rasterizador va en su
+  propio hilo (`PS2X_GS_THREAD=0` lo desactiva) y reparte por bandas de 8 filas entre varios hilos las primitivas cuyo
+  destino no solapa la textura (`PS2X_GS_RASTER_THREADS=N`); prueba Z antes de leer la textura; los triangulos solo
+  recorren el tramo que cubren sus aristas; el VU1 recorre solo las entradas validas de sus colas. Con un flujo del GS
+  grabado en el nivel 1: 8,8 s -> 4,9 s, con las 38 imagenes y la VRAM final identicas bit a bit.
+- `ps2recomp-ee-idle-iop.patch`: con todos los hilos del EE parados, `EeScheduler::waitForEvent` esperaba al siguiente
+  plazo (el VSync, en tiempo real) y solo entonces daba esos ciclos al IOP de golpe: cada peticion al IOP desde un hilo
+  que se queda esperando (lectura de CD por GTFSCDVD, RPC) costaba un VSync entero. Ahora adelanta el tiempo en pasos de
+  32 768 ciclos del EE, haciendo correr al IOP, y vuelve en cuanto hay algo que atender en el EE (evento, invocacion SIF,
+  hilo listo o temporizador). Si nada despierta, espera al plazo como antes (mismo ritmo en tiempo real).
 
 Herramientas propias (sin parche: `runner/blade_devtools.cpp`, solo se activan con variables de entorno):
-- `BLADE_DUMP_FRAMES=carpeta[,cada_N[,desde]]`: guarda en PNG la imagen presentada cada N VSync (`frame_TTTTTT.png`).
+- `BLADE_DUMP_FRAMES=carpeta[,cada_N[,desde]]`: guarda en PNG la imagen presentada cada N VSync (`frame_TTTTTT.png`;
+  si los VSync van a saltos, al cruzar cada multiplo de N, con el VSync real en el nombre).
 - `BLADE_INPUT="300:START;420+20:CROSS;500:UP,CROSS"`: pulsa botones del mando 1 en VSync concretos
   (`TICK[+DURACION]:BOTONES`, duracion por defecto 6; tambien `LX=`/`LY=` para el stick izquierdo).
-- `BLADE_DUMP_RAM=carpeta,VSync[,VSync...]`: guarda los 32 MB de RAM del EE en cada VSync indicado (`ram_TTTTTT.bin`).
+  Cada paso se mantiene al menos 150 ms reales aunque los VSync corran mas que el sondeo (con el EE ocioso el tiempo
+  avanza a saltos).
+- `BLADE_DUMP_RAM=carpeta,VSync[,VSync...]`: guarda los 32 MB de RAM del EE en cada VSync indicado (`ram_TTTTTT.bin`)
+  y escribe en la salida el estado de los hilos del EE (`entry`, `pc`, `ra`, `sp`, espera) y
+  de los semaforos (`[blade:kernel]`); con `sp` se recorre la pila en el volcado.
 - `BLADE_EXIT_TICK=N`: cierra el proceso en el VSync N (pruebas sin ventana atendida).
+- `BLADE_HIDDEN=1`: ventana oculta y sin foco (pruebas en segundo plano; los PNG se siguen guardando).
 - Guion que llega hasta el modo historia: `BLADE_INPUT="300:START;400:START;500:START;600:START;700:START;900:CROSS;1050:CROSS;1200:CROSS;2250:CROSS;2400:CROSS"`.
 
 ## Estado (2026-11-10)
@@ -137,13 +153,21 @@ Herramientas propias (sin parche: `runner/blade_devtools.cpp`, solo se activan c
   abren ("RwaStreamOpen : Opened and prepared") y el fundido se abre. El tiempo del flujo sale de la posicion de la voz
   en el SPU2 (`RwaVoiceGetWavePos` -> `sceSdGetAddr`, NAX), que no existia: el mismo parche anade un modelo minimo de
   voces del SPU2 y el tiempo avanza a ritmo real (12,6 s en el VSync 3000, 21,0 s en el 3500).
-- Ahora: la escena de entrada del nivel 1 se ve y la camara recorre el escenario (escalera, pasillo, puerta con carteles),
-  con barras de cine y el letrero LOADING abajo. Sigue igual en el VSync 5200 (unos 2 800 VSync despues de entrar), asi
-  que aun no se llega a controlar al personaje.
-- Pendiente 1: la entrada no termina (LOADING fijo durante todo el recorrido). Falta ver que espera el juego para dar paso
-  al control: fin del flujo de audio (estado del flujo en 0x317540 al llegar al final del fichero, ENDX de la voz con el
-  ultimo bloque), lecturas de CD pendientes de GTFSCDVD o el boton para saltar la escena. La banda superior (filas
-  0-95, bajo la barra de cine) muestra texturas: es el mismo solape de VRAM que el menu (Pendiente 2).
+- Bloqueo 8 (resuelto, LOADING sin fin): durante la escena de entrada el hilo de carga (0x16B0A0, peticion en
+  0x305F50: `L1\L1.BIN`, 6,2 MB) lee el resto del nivel en segundo plano mientras el hilo principal dibuja la escena;
+  el letrero LOADING sigue hasta que acaba. Iba a un sector (2 KB) por VSync: el fichero (0x334E00, posicion en +4)
+  pasaba de 0x30000 a 0xA4800 en 200 VSync, unos 2 600 VSync para todo el fichero. Causa: con los dos hilos del EE
+  esperando (el principal duerme en 0x16B040 hasta que le despiertan; el de carga espera la lectura de GTFSCDVD), el
+  planificador del EE dormia hasta el siguiente VSync y solo entonces daba los ciclos al IOP, asi que cada lectura
+  costaba un VSync. Parche `ps2recomp-ee-idle-iop.patch` (ver Parches). Con eso la carga acaba en unos cientos de
+  VSync y la escena termina en "X CONTINUE". (El estado del flujo de audio no tenia que ver: el objeto de la escena
+  sale de ella cuando `0x131E20` ve el flujo parado o con el tiempo hacia atras; el flujo 1 sigue en estado 4.)
+- Bloqueo 9 (resuelto): al pulsar X en CONTINUE el hilo principal moria (`[guest-branch:missing-target]`, `jalr` desde
+  0x1918B8 a 0x232320, tercer metodo de una tabla con 0x232D20 y 0x2328B0). Ghidra no creo esa funcion (0x590 bytes,
+  pegada al `jr $ra` de 0x23231C y solo alcanzable por puntero). `filter_ghidra_map.py` acepta ahora huecos de hasta
+  0x4000 bytes que terminan en `jr $ra` + delay slot (+ relleno) justo antes de la funcion siguiente; recupera 0x232320
+  y 0x1E0510 (un `switch` al que apunta 0x2E4DD4). Un barrido de los punteros de los datos a codigo fuera de funciones
+  no encuentra mas.
 - Pendiente 2 (menu corrupto): cada imagen el menu sube el video de fondo (MENUBASE.M2V, 640x512) como 40 trozos CT32
   de 128x64 en los bloques 1536..6655 y las fuentes detras (hasta ~8032), pero los buffers de pantalla estan en las
   paginas 160 y 320 (bloques 5120 y 10240) y el Z en la 480 (Z16S, 80 paginas, da la vuelta a 0-47). Los trozos 28-39 y

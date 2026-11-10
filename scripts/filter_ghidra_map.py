@@ -8,7 +8,8 @@
    punteros sueltos de los datos no se usan porque meten zonas de datos como codigo. Se aceptan solo si parecen un inicio (detras de `jr $ra` + delay slot, detras de relleno, o con
    `addiu $sp,$sp,-N`), para no cortar nunca en un delay slot. Misma idea que tools/find_missing_starts.py de
    hctp-recomp (GPL-3.0).
-3. Codigo en huecos pequenos (<= 0x400) entre funciones: su primer word no nulo es un inicio.
+3. Codigo en huecos pequenos (<= 0x400) entre funciones: su primer word no nulo es un inicio. En huecos grandes, solo
+   una hoja corta pegada a la funcion anterior o un hueco (<= 0x4000) que acaba en `jr $ra` + delay slot + relleno.
 
 Uso: filter_ghidra_map.py ghidra.csv game.elf salida.csv
 """
@@ -84,6 +85,17 @@ def short_leaf(t):
             return None
     return None
 
+def code_gap(t, nxt):
+    # hueco de hasta 0x4000 bytes que acaba en `jr $ra` + delay slot (+ relleno) y sin `eret`
+    if nxt - t > 0x4000:
+        return False
+    v = nxt - 4
+    while v > t and word(v) == 0:
+        v -= 4
+    if word(v - 4) != 0x03E00008 and word(v) != 0x03E00008:  # delay slot no nulo, o nop tomado por relleno
+        return False
+    return all(word(a) != 0x42000018 for a in range(t, nxt, 4))
+
 # 3. Codigo en huecos pequenos entre funciones que Ghidra no asigno a ninguna (p. ej. 0x1DB030: detras de un `j` de
 #    cola + delay slot y solo alcanzable por puntero). El primer word no nulo del hueco es un inicio.
 known = sorted(set(funcs) | set(added))
@@ -104,6 +116,11 @@ for i, s in enumerate(known[:-1]):
         # (ultima del texto, llamada por puntero desde 0x24D040). Termina en su `jr $ra` + delay slot.
         gaps.append(t)
         leaf_end[t] = short_leaf(t)
+    elif t < known[i + 1] and not inside(t) and plausible(t) and code_gap(t, known[i + 1]):
+        # Hueco grande que es todo codigo: termina en `jr $ra` + delay slot + relleno justo antes de la funcion
+        # siguiente, p. ej. 0x232320 (metodo de una tabla, llamado por puntero desde 0x1918B8, 0x590 bytes) o 0x1E0510
+        # (un `switch` de 0x4C0 bytes al que se llega por un puntero en 0x2E4DD4).
+        gaps.append(t)
 added = sorted(set(added) | set(gaps))
 
 

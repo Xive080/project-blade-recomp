@@ -28,10 +28,15 @@ Heredados del proyecto hermano de Vampire Night, que usa el mismo runtime:
   de instruccion no soportada y son datos (texto ASCII tomado por codigo, p. ej. `0x47656373` = "secG"); se saltan con `skip`
   (`scripts/make_skip.py`) y la segunda pasada genera 3 316 ficheros C++ (99 MB) con 0 errores.
 - Build: `build/blade/blade_recomp` compila y enlaza en macOS arm64 (sse2neon, sin FFmpeg), 40 MB.
-- Primer arranque: carga el ELF, aplica el override, salta a la entrada 0x233218 y abre ventana y audio. La ventana se queda en
-  magenta (no llega ningun dibujo) y no salen stubs sin implementar.
-- Donde se queda: `sub_00113F40` reintenta en bucle una llamada que hace `sceSifBindRpc` (`sub_0010BDE0`/`sub_0010CBF8`), con
-  esperas activas entre intentos. Es decir, espera a un servidor RPC del IOP que nadie atiende. Hipotesis: es uno de los modulos
-  propios del disco, `IRX/GTFSCDVD.IRX` (sistema de ficheros de CD de Criterion) o `IRX/TSSDRV.IRX` (sonido); los demas
-  (SIO2MAN, PADMAN, MCMAN, MCSERV, LIBSD) son modulos estandar de Sony.
-- Siguiente: saber que id de RPC pide, y implementar ese servidor en el runtime o cargar el IRX en el emulador de IOP.
+- Primer arranque: carga el ELF, salta a la entrada 0x233218 y abre ventana y audio. La ventana se queda en magenta (no
+  llega ningun dibujo).
+- Bloqueo 1 (resuelto): `sub_00113F40` reintentaba sin fin `sceSifBindRpc(0x8000059A)`. Es `sceCdDiskReady(mode)` de libcdvd
+  (el ELF no tiene simbolos y el analizador no la reconocio): espera al servidor CDVDFSV, que vive en la BIOS y aqui no existe.
+  `runner/blade_overrides.cpp` la sustituye por el stub HLE del runtime. Con eso el juego carga los 7 IRX del disco
+  (SIO2MAN, PADMAN, MCMAN, MCSERV, GTFSCDVD, LIBSD, TSSDRV) en el IOP emulado y arranca su servicio de audio.
+- Bloqueo 2 (abierto): `jalr` a 0 en 0x1C805C, dentro de RenderWare: al crear un freelist llama a la funcion de reserva de
+  memoria de la tabla del motor (`[s2+0x130]`, probablemente `RwEngineInstance->memoryFuncs.rwmalloc`) y esa tabla sigue a
+  cero. Hipotesis: falta un paso de inicializacion del motor antes (otra funcion de SDK sin reconocer o un override que
+  hace falta). Siguiente: localizar quien escribe esa tabla y por que no se ejecuto.
+- Otras funciones de libcdvd sin nombre en el mismo bloque (0x113070, 0x1132A8, 0x113340, 0x113470, 0x1137D8, 0x113AF0): si
+  alguna vuelve a esperar al IOP, se identifica igual (SID y numero de funcion RPC) y se sustituye por su stub.

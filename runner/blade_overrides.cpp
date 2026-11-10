@@ -5,6 +5,10 @@
 #include "ps2_runtime_macros.h"
 #include "ps2_stubs.h"
 
+#include <cstdlib>
+#include <filesystem>
+#include <iostream>
+
 namespace
 {
     // 0x113F40 = sceCdDiskReady(mode) de libcdvd. El ELF no tiene simbolos y el analizador no la reconocio, asi que se
@@ -17,9 +21,38 @@ namespace
         ps2_stubs::sceCdDiskReady(rdram, ctx, runtime);
     }
 
+    // GTFSCDVD.IRX (el lector propio del juego en el IOP) pide sectores por su LSN del disco original (p. ej.
+    // 0x1E391C, ~3,8 GB dentro del DVD). Con solo la carpeta extraida el IOP arma un ISO virtual con otros LSN, esas
+    // lecturas fallan y el modulo reintenta sin fin. Con la imagen del propio disco, las lecturas por LSN son exactas.
+    // Se busca en BLADE_ISO o en game.iso junto al ELF; sin rutas fijas.
+    void useDiscImage()
+    {
+        PS2Runtime::IoPaths paths = PS2Runtime::getIoPaths();
+        if (!paths.cdImage.empty())
+            return;
+        std::filesystem::path image;
+        if (const char *env = std::getenv("BLADE_ISO"); env && *env)
+            image = env;
+        else
+            image = paths.elfDirectory / "game.iso";
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(image, ec))
+        {
+            paths.cdImage = image;
+            PS2Runtime::setIoPaths(paths);
+            std::cout << "[blade] imagen del disco: " << image.string() << std::endl;
+        }
+        else
+        {
+            std::cout << "[blade] sin imagen del disco (BLADE_ISO o game.iso junto al ELF): las lecturas por LSN de "
+                         "GTFSCDVD fallaran" << std::endl;
+        }
+    }
+
     void applyBlade(PS2Runtime &runtime)
     {
         runtime.replaceFunction(0x00113F40u, ovCdDiskReady);
+        useDiscImage();
     }
 }
 

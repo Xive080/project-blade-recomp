@@ -1,0 +1,93 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
+index b50a4cf..a804273 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
+@@ -13,6 +13,10 @@ namespace ps2_stubs
+         constexpr int32_t kPadStateDisconnected = 0;
+         constexpr int32_t kPadStateExecCmd = 5;
+         constexpr int32_t kPadStateStable = 6;
++        // scePadReqState*: el libpad real deja cada peticion (PortOpen, SetMainMode, SetActAlign...) en BUSY hasta que
++        // el PADMAN del IOP la completa. Hay juegos que esperan a ver BUSY tras abrir el puerto (AirBlade, 0x177318).
++        constexpr uint32_t kPadReqStateComplete = 0u;
++        constexpr uint32_t kPadReqStateBusy = 2u;
+         constexpr size_t kPadPortCount = 2;
+         constexpr size_t kPadSlotCount = 1;
+ 
+@@ -364,7 +368,7 @@ namespace ps2_stubs
+         }
+ 
+         portState->pressureEnabled = true;
+-        portState->reqState = 0u;
++        portState->reqState = kPadReqStateBusy;
+         queueExecCmdStateLocked(*portState);
+         setReturnS32(ctx, 1);
+     }
+@@ -382,7 +386,7 @@ namespace ps2_stubs
+         }
+ 
+         portState->pressureEnabled = false;
+-        portState->reqState = 0u;
++        portState->reqState = kPadReqStateBusy;
+         queueExecCmdStateLocked(*portState);
+         setReturnS32(ctx, 1);
+     }
+@@ -437,9 +441,14 @@ namespace ps2_stubs
+         (void)rdram;
+         (void)runtime;
+         std::lock_guard<std::mutex> lock(g_padStateMutex);
+-        const PadPortState *portState = lookupPadPortStateLocked(static_cast<int>(getRegU32(ctx, 4)),
+-                                                                 static_cast<int>(getRegU32(ctx, 5)));
+-        setReturnS32(ctx, static_cast<int32_t>(portState ? portState->reqState : 0u));
++        PadPortState *portState = lookupPadPortStateLocked(static_cast<int>(getRegU32(ctx, 4)),
++                                                           static_cast<int>(getRegU32(ctx, 5)));
++        setReturnS32(ctx, static_cast<int32_t>(portState ? portState->reqState : kPadReqStateComplete));
++        // Sin PADMAN HLE que la complete, una peticion se ve BUSY en una consulta y queda completada.
++        if (portState && portState->reqState == kPadReqStateBusy)
++        {
++            portState->reqState = kPadReqStateComplete;
++        }
+     }
+ 
+     void scePadGetSlotMax(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+@@ -614,7 +623,7 @@ namespace ps2_stubs
+         portState->pressureEnabled = false;
+         portState->buttonMask = 0xFFFFu;
+         portState->dmaAddr = dmaAddr;
+-        portState->reqState = 0u;
++        portState->reqState = kPadReqStateBusy;
+         portState->transientState = 0u;
+         if (dmaStr)
+         {
+@@ -689,6 +698,14 @@ namespace ps2_stubs
+     {
+         (void)rdram;
+         (void)runtime;
++        std::lock_guard<std::mutex> lock(g_padStateMutex);
++        PadPortState *portState = lookupPadPortStateLocked(static_cast<int>(getRegU32(ctx, 4)),
++                                                           static_cast<int>(getRegU32(ctx, 5)));
++        if (portState && portState->open)
++        {
++            portState->reqState = kPadReqStateBusy;
++            queueExecCmdStateLocked(*portState);
++        }
+         setReturnS32(ctx, 1);
+     }
+ 
+@@ -709,7 +726,7 @@ namespace ps2_stubs
+         if (portState && portState->open)
+         {
+             portState->buttonMask = static_cast<uint16_t>(getRegU32(ctx, 6));
+-            portState->reqState = 0u;
++            portState->reqState = kPadReqStateBusy;
+             queueExecCmdStateLocked(*portState);
+         }
+         setReturnS32(ctx, 1);
+@@ -729,7 +746,7 @@ namespace ps2_stubs
+         }
+ 
+         portState->analogMode = (getRegU32(ctx, 6) != 0u);
+-        portState->reqState = 0u;
++        portState->reqState = kPadReqStateBusy;
+         queueExecCmdStateLocked(*portState);
+         setReturnS32(ctx, 1);
+     }

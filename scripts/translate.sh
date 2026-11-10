@@ -21,3 +21,10 @@ grep '\[error\]' work/run.log | sed -E 's/.*function=([^ ]+).*/\1/' | sort -u > 
 python3 scripts/make_skip.py work/game.toml work/errfuncs.txt work/game_skip.toml
 $B/ps2xRecomp/ps2_recomp work/game_skip.toml > work/run2.log 2>&1 || true
 echo "segunda pasada, errores: $(grep -c '\[error\]' work/run2.log)"
+# tercera pasada (recomendada): limites de funcion de Ghidra (scripts/ghidra_map.sh)
+if [ -f work/ghidra_map.csv ]; then
+  sed 's|^ghidra_output = .*|ghidra_output = "work/ghidra_map.csv"|' work/game_skip.toml > work/game_ghidra.toml
+  rm -rf work/output2
+  $B/ps2xRecomp/ps2_recomp work/game_ghidra.toml > work/run3.log 2>&1 || true
+  echo "pasada con mapa de Ghidra, errores: $(grep -c '\[error\]' work/run3.log)"
+fi

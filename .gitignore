@@ -1,0 +1,10 @@
+# Datos del juego y codigo generado: nunca versionar
+disc/
+work/
+*.elf
+*.iso
+# Build y dependencias externas (se clonan con scripts/translate.sh)
+build/
+build-*.log
+third_party/
+.DS_Store

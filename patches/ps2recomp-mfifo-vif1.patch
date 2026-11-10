@@ -1,0 +1,144 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index ea86a9c..48b1bb1 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -450,6 +450,7 @@ public:
+ 
+     std::array<EeTimer, 4> m_eeTimers{};
+     bool tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr);
++    void drainMfifoVif1();
+     void completeDmacChannel(uint32_t channelBase, uint32_t cause);
+     void queueCompletedDmacCause(uint32_t cause);
+ };
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 37b6a4d..2bd5e05 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1337,6 +1337,12 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                 {
+                     enqueueTransfer(madr, qwc);
+                 }
++                else if (mode == 1 && channelBase == 0x10009000u && ((m_ioRegisters[0x1000E000u] >> 2) & 0x3u) == 2u)
++                {
++                    // VIF1 en modo MFIFO: consume del anillo lo que el canal SPR vaya produciendo
++                    m_ioRegisters[channelBase] = chcr | 0x100u;
++                    drainMfifoVif1();
++                }
+                 else if (mode == 1)
+                 {
+                     uint32_t tagAddr = m_ioRegisters[channelBase + 0x30];
+@@ -1636,13 +1642,113 @@ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
+         scratchOffset = (scratchOffset + chunk) & (PS2_SCRATCHPAD_SIZE - 1u);
+     }
+ 
+-    m_ioRegisters[channelBase + 0x10u] = (originalMadr + byteCount) & 0x7FFFFFF0u;
++    uint32_t newMadr = (originalMadr + byteCount) & 0x7FFFFFF0u;
++    const bool mfifoOut = fromScratchpad && (((m_ioRegisters[0x1000E000u] >> 2) & 0x3u) != 0u);
++    if (mfifoOut)
++    {
++        const uint32_t rbsr = m_ioRegisters[0x1000E040u];
++        const uint32_t rbor = m_ioRegisters[0x1000E050u];
++        newMadr = ((rbor & ~rbsr) | (newMadr & rbsr)) & 0x7FFFFFF0u;
++    }
++    m_ioRegisters[channelBase + 0x10u] = newMadr;
+     m_ioRegisters[channelBase + 0x20u] = 0u;
+     m_ioRegisters[channelBase + 0x80u] = (originalSadr + byteCount) & 0x3FF0u;
+     completeDmacChannel(channelBase, fromScratchpad ? 8u : 9u);
++    if (mfifoOut)
++        drainMfifoVif1();
+     return true;
+ }
+ 
++// MFIFO (D_CTRL.MFD = 2): VIF1 lee cadenas DMA del anillo [RBOR, RBOR+RBSR] hasta alcanzar el MADR del canal SPR.
++void PS2Memory::drainMfifoVif1()
++{
++    static constexpr uint32_t kVif1 = 0x10009000u;
++    static constexpr uint32_t kSprFrom = 0x1000D000u;
++    if (((m_ioRegisters[0x1000E000u] >> 2) & 0x3u) != 2u)
++        return;
++    const uint32_t chcr = m_ioRegisters[kVif1];
++    if ((chcr & 0x100u) == 0u || ((chcr >> 2) & 0x3u) != 1u)
++        return;
++
++    const uint32_t rbsr = m_ioRegisters[0x1000E040u];
++    const uint32_t rbor = m_ioRegisters[0x1000E050u];
++    auto wrap = [&](uint32_t a) { return ((rbor & ~rbsr) | (a & rbsr)) & 0x7FFFFFF0u; };
++    auto phys = [&](uint32_t a, uint32_t n) -> const uint8_t * {
++        try
++        {
++            const uint32_t o = translateAddress(a);
++            if (o + n > PS2_RAM_SIZE)
++                return nullptr;
++            return m_rdram + o;
++        }
++        catch (const std::exception &)
++        {
++            return nullptr;
++        }
++    };
++
++    uint32_t tadr = wrap(m_ioRegisters[kVif1 + 0x30u]);
++    const uint32_t madr = wrap(m_ioRegisters[kSprFrom + 0x10u]);
++    std::vector<uint8_t> buf;
++    int guard = 0;
++    while (tadr != madr && guard++ < 4096)
++    {
++        const uint8_t *tp = phys(tadr, 16);
++        if (!tp)
++            break;
++        uint64_t tag = 0;
++        std::memcpy(&tag, tp, 8);
++        const uint32_t qwc = static_cast<uint32_t>(tag & 0xFFFFu);
++        const uint32_t id = static_cast<uint32_t>((tag >> 28) & 0x7u);
++        const uint32_t addr = static_cast<uint32_t>((tag >> 32) & 0x7FFFFFFFu);
++        const bool inRing = (id == 0u || id == 1u || id == 7u);
++        if (inRing)
++        {
++            // el tag y su carga deben estar completos en el anillo
++            const uint32_t avail = (madr - tadr) & rbsr;
++            if (avail < 16u + qwc * 16u)
++                break;
++        }
++        if ((chcr & 0x40u) != 0u)
++            buf.insert(buf.end(), tp + 8, tp + 16);
++        uint32_t next = wrap(tadr + 16u);
++        if (qwc != 0u)
++        {
++            uint32_t src = inRing ? wrap(tadr + 16u) : addr;
++            uint32_t left = qwc * 16u;
++            while (left != 0u)
++            {
++                uint32_t chunk = left;
++                if (inRing)
++                {
++                    const uint32_t ringEnd = (rbor & ~rbsr) + rbsr + 16u;
++                    chunk = std::min(chunk, ringEnd - src);
++                }
++                const uint8_t *dp = phys(src, chunk);
++                if (!dp)
++                    break;
++                buf.insert(buf.end(), dp, dp + chunk);
++                src = inRing ? wrap(src + chunk) : (src + chunk);
++                left -= chunk;
++            }
++            if (inRing)
++                next = wrap(tadr + 16u + qwc * 16u);
++        }
++        tadr = next;
++    }
++    m_ioRegisters[kVif1 + 0x30u] = tadr;
++    if (!buf.empty())
++    {
++        PendingTransfer pt;
++        pt.fromScratchpad = false;
++        pt.srcAddr = 0;
++        pt.qwc = 0;
++        pt.chainData = std::move(buf);
++        m_pendingVif1Transfers.push_back(std::move(pt));
++        processPendingTransfers();
++    }
++}
++
+ void PS2Memory::completeDmacChannel(uint32_t channelBase, uint32_t cause)
+ {
+     static constexpr uint32_t kDStat = 0x1000E010u;

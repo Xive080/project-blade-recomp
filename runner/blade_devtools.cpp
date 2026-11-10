@@ -5,7 +5,7 @@
 //                                        pulsa botones del mando 1 en VSync concretos. Cada paso es TICK[+DURACION]:BOTONES
 //                                        (duracion por defecto 6 VSync; botones separados por comas; prefijo "t=" opcional).
 //                                        Mientras el guion tiene pasos pendientes el teclado no cuenta; al acabar se suelta.
-//   BLADE_DUMP_RAM=carpeta,VSync         guarda la RAM del EE (32 MB) en carpeta/ram_VSync.bin al llegar a ese VSync.
+//   BLADE_DUMP_RAM=carpeta,VSync[,VSync...] guarda la RAM del EE (32 MB) en carpeta/ram_VSync.bin al llegar a cada VSync.
 //   BLADE_EXIT_TICK=N                    cierra el proceso al llegar al VSync N (para pruebas sin ventana atendida).
 // Leen el marco ya presentado (GS::copyLatchedHostPresentationFrame, protegido por su mutex) y usan el estado forzado
 // de libpad (setPadOverrideState), asi que no tocan el runtime.
@@ -118,7 +118,7 @@ namespace
     }
 
     void devLoop(PS2Runtime *rt, std::filesystem::path dumpDir, uint64_t dumpEvery, uint64_t dumpFrom, std::vector<InputStep> steps,
-                 uint64_t exitTick, std::filesystem::path ramDir, uint64_t ramTick)
+                 uint64_t exitTick, std::filesystem::path ramDir, std::vector<uint64_t> ramTicks)
     {
         uint64_t last = ~0ull;
         bool overrideOn = false;
@@ -159,7 +159,7 @@ namespace
             // el marco presentado se fija en el hilo de la ventana al cambiar de VSync: se lee uno despues
             if (!dumpDir.empty() && tick > dumpFrom && (tick % dumpEvery) == (1u % dumpEvery))
                 writeFrame(dumpDir, tick - 1u, *rt);
-            if (ramTick && tick >= ramTick && !ramDir.empty())
+            if (!ramTicks.empty() && tick >= ramTicks.front() && !ramDir.empty())
             {
                 char name[64];
                 std::snprintf(name, sizeof(name), "ram_%06llu.bin", static_cast<unsigned long long>(tick));
@@ -169,7 +169,7 @@ namespace
                     std::fclose(f);
                     std::cout << "[blade] RAM guardada en VSync " << tick << std::endl;
                 }
-                ramTick = 0;
+                ramTicks.erase(ramTicks.begin());
             }
             if (exitTick && tick >= exitTick)
             {
@@ -212,19 +212,24 @@ void bladeStartDevTools(PS2Runtime &runtime)
     if (const char *env = std::getenv("BLADE_EXIT_TICK"); env && *env)
         exitTick = std::strtoull(env, nullptr, 10);
     std::filesystem::path ramDir;
-    uint64_t ramTick = 0;
+    std::vector<uint64_t> ramTicks;
     if (const char *env = std::getenv("BLADE_DUMP_RAM"); env && *env)
     {
         std::string v = env;
         if (const size_t comma = v.find(','); comma != std::string::npos)
         {
-            ramTick = std::strtoull(v.c_str() + comma + 1, nullptr, 10);
+            std::stringstream ts(v.substr(comma + 1));
+            std::string t;
+            while (std::getline(ts, t, ','))
+                if (const uint64_t n = std::strtoull(t.c_str(), nullptr, 10))
+                    ramTicks.push_back(n);
+            std::sort(ramTicks.begin(), ramTicks.end());
             ramDir = v.substr(0, comma);
             std::error_code ec;
             std::filesystem::create_directories(ramDir, ec);
         }
     }
-    if (dumpDir.empty() && steps.empty() && !exitTick && !ramTick)
+    if (dumpDir.empty() && steps.empty() && !exitTick && ramTicks.empty())
         return;
-    std::thread(devLoop, &runtime, dumpDir, dumpEvery, dumpFrom, std::move(steps), exitTick, ramDir, ramTick).detach();
+    std::thread(devLoop, &runtime, dumpDir, dumpEvery, dumpFrom, std::move(steps), exitTick, ramDir, std::move(ramTicks)).detach();
 }

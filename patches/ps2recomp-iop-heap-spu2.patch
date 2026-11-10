@@ -1,0 +1,439 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+index 25e9b36..7ae84ae 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -37,6 +37,10 @@ namespace ps2x::iop::detail
+         m_interruptMask = 0;
+         m_interruptControl = 1;
+         m_dmaStart.reset();
++        m_spuRam.assign(2u * 1024u * 1024u, uint8_t{0});
++        m_spuVoices = {};
++        m_spuLastCycle = m_cycleSource ? *m_cycleSource : 0u;
++        m_spuEndx[0] = m_spuEndx[1] = 0u;
+     }
+ 
+     uint32_t IopMemory::physicalAddress(uint32_t address) noexcept
+@@ -121,6 +125,14 @@ namespace ps2x::iop::detail
+             markOwned(phys, sizeof(value));
+             return;
+         }
++        if (phys >= Spu2Base && phys < Spu2End && (phys & 1u) == 0u)
++        {
++            const uint32_t aligned = phys & ~3u;
++            const uint32_t shift = (phys & 2u) * 8u;
++            const uint32_t current = readHardware32(aligned);
++            writeHardware32(aligned, (current & ~(0xFFFFu << shift)) | (static_cast<uint32_t>(value) << shift));
++            return;
++        }
+         write8(address, static_cast<uint8_t>(value));
+         write8(address + 1u, static_cast<uint8_t>(value >> 8u));
+     }
+@@ -213,6 +225,11 @@ namespace ps2x::iop::detail
+ 
+     uint32_t IopMemory::readHardware32(uint32_t address) const
+     {
++        if (address >= Spu2Base && address < Spu2End)
++        {
++            const auto stored = m_hardware.find(address);
++            return spuOverride(address, stored != m_hardware.end() ? stored->second : 0u);
++        }
+         const auto value = m_hardware.find(address);
+         if (value != m_hardware.end())
+             return value->second;
+@@ -246,6 +263,15 @@ namespace ps2x::iop::detail
+             break;
+         }
+ 
++        if (address >= Spu2Base && address < Spu2End)
++        {
++            const auto stored = m_hardware.find(address);
++            const uint32_t oldValue = stored != m_hardware.end() ? stored->second : 0u;
++            m_hardware[address] = value;
++            spuWrite(address, oldValue, value);
++            return;
++        }
++
+         m_hardware[address] = value;
+         if ((address != kDmaSpu0Chcr && address != kDmaSpu1Chcr) || (value & kDmaStart) == 0u)
+             return;
+@@ -269,6 +295,13 @@ namespace ps2x::iop::detail
+         const uint32_t wordsPerBlock = std::max<uint32_t>(blockControl & 0xFFFFu, 1u);
+         const uint32_t blockCount = std::max<uint32_t>(blockControl >> 16u, 1u);
+         const uint64_t transferWords = static_cast<uint64_t>(wordsPerBlock) * blockCount;
++        {
++            uint32_t madr = 0u;
++            if (const auto current = m_hardware.find(address - 8u); current != m_hardware.end())
++                madr = current->second;
++            spuDmaTransfer(secondCore, madr, static_cast<uint32_t>(std::min<uint64_t>(transferWords * 4u, 2u * 1024u * 1024u)),
++                           (value & 1u) != 0u);
++        }
+         m_dmaStart = DmaStart{
+             secondCore ? kDmaSpu1Irq : kDmaSpu0Irq,
+             std::max<uint64_t>(transferWords * 2u, 64u),
+@@ -294,30 +327,32 @@ namespace ps2x::iop::detail
+             for (const auto &block : m_allocations)
+                 if (address < block.address + block.size && block.address < address + size)
+                     return 0u;
+-            m_allocations.push_back({address, size});
++            const auto position = std::upper_bound(m_allocations.begin(), m_allocations.end(), address,
++                                                   [](uint32_t value, const Allocation &block)
++                                                   { return value < block.address; });
++            m_allocations.insert(position, {address, size});
+             markOwned(address, size);
+             return address;
+         }
+ 
+-        uint32_t candidate = alignUp(m_heapCursor, alignment);
+-        for (;;)
++        // Primer hueco libre desde el principio del monton (como AllocSysMemory en modo FIRST): un cursor que solo
++        // crece no reutiliza lo liberado y el monton se agota tras unas cuantas reservas y liberaciones.
++        uint32_t candidate = alignUp(HeapBase, alignment);
++        for (const auto &block : m_allocations)
+         {
+-            bool overlap = false;
+-            for (const auto &block : m_allocations)
+-            {
+-                if (candidate < block.address + block.size && block.address < candidate + size)
+-                {
+-                    candidate = alignUp(block.address + block.size, alignment);
+-                    overlap = true;
+-                    break;
+-                }
+-            }
+-            if (!overlap)
++            if (candidate + size <= block.address)
+                 break;
++            if (block.address + block.size > candidate)
++                candidate = alignUp(block.address + block.size, alignment);
+         }
+         if (candidate > HeapLimit || size > HeapLimit - candidate)
++        {
+             return 0u;
+-        m_allocations.push_back({candidate, size});
++        }
++        const auto position = std::upper_bound(m_allocations.begin(), m_allocations.end(), candidate,
++                                               [](uint32_t address, const Allocation &block)
++                                               { return address < block.address; });
++        m_allocations.insert(position, {candidate, size});
+         markOwned(candidate, size);
+         m_heapCursor = std::max(m_heapCursor, candidate + size);
+         return candidate;
+@@ -339,7 +374,17 @@ namespace ps2x::iop::detail
+ 
+     uint32_t IopMemory::maxFreeMemory() const
+     {
+-        return m_heapCursor < HeapLimit ? HeapLimit - m_heapCursor : 0u;
++        uint32_t largest = 0u;
++        uint32_t cursor = HeapBase;
++        for (const auto &block : m_allocations)
++        {
++            if (block.address > cursor)
++                largest = std::max(largest, block.address - cursor);
++            cursor = std::max(cursor, block.address + block.size);
++        }
++        if (HeapLimit > cursor)
++            largest = std::max(largest, HeapLimit - cursor);
++        return largest;
+     }
+ 
+     std::optional<IopMemory::Allocation> IopMemory::allocationContaining(uint32_t address) const
+@@ -368,4 +413,208 @@ namespace ps2x::iop::detail
+         }
+         return result;
+     }
++    // ---- SPU2 (modelo de voces) ----
++    namespace
++    {
++        constexpr uint32_t kSpuRamBytes = 2u * 1024u * 1024u;
++        constexpr uint32_t kSpuCoreStride = 0x400u;
++        constexpr uint64_t kSpuSampleRate = 48000u;
++        constexpr uint64_t kIopHz = 36864000u;
++        constexpr uint32_t kSamplesPerBlock = 28u;
++
++        // registro relativo al nucleo (0..0x3FF) y nucleo, o false si no es un registro de nucleo
++        bool spuCoreRegister(uint32_t address, uint32_t &core, uint32_t &reg)
++        {
++            const uint32_t offset = address - IopMemory::Spu2Base;
++            if (offset >= 2u * kSpuCoreStride)
++                return false;
++            core = offset / kSpuCoreStride;
++            reg = offset % kSpuCoreStride;
++            return true;
++        }
++    }
++
++    uint16_t IopMemory::spuReg(uint32_t address) const
++    {
++        const auto stored = m_hardware.find(address & ~3u);
++        const uint32_t word = stored != m_hardware.end() ? stored->second : 0u;
++        return static_cast<uint16_t>(word >> ((address & 2u) * 8u));
++    }
++
++    void IopMemory::spuSetReg(uint32_t address, uint16_t value) const
++    {
++        auto &word = const_cast<std::unordered_map<uint32_t, uint32_t> &>(m_hardware)[address & ~3u];
++        const uint32_t shift = (address & 2u) * 8u;
++        word = (word & ~(0xFFFFu << shift)) | (static_cast<uint32_t>(value) << shift);
++    }
++
++    void IopMemory::spuAdvance() const
++    {
++        const uint64_t now = m_cycleSource ? *m_cycleSource : 0u;
++        if (now <= m_spuLastCycle)
++            return;
++        const uint64_t elapsed = now - m_spuLastCycle;
++        m_spuLastCycle = now;
++        for (uint32_t index = 0; index < m_spuVoices.size(); ++index)
++        {
++            SpuVoice &voice = m_spuVoices[index];
++            if (!voice.active)
++                continue;
++            const uint32_t core = index / 24u;
++            const uint32_t slot = index % 24u;
++            const uint64_t pitch = std::min<uint32_t>(spuReg(Spu2Base + core * kSpuCoreStride + slot * 0x10u + 4u), 0x3FFFu);
++            // muestras * 4096 avanzadas en este intervalo
++            voice.fraction += elapsed * kSpuSampleRate * pitch / kIopHz;
++            constexpr uint64_t kBlockUnits = static_cast<uint64_t>(kSamplesPerBlock) * 4096u;
++            uint32_t guard = 0;
++            while (voice.active && voice.fraction >= kBlockUnits && guard++ < 65536u)
++            {
++                voice.fraction -= kBlockUnits;
++                const uint8_t flags = m_spuRam[(voice.nax + 1u) % kSpuRamBytes];
++                if ((flags & 0x04u) != 0u && !voice.lsaxSet)
++                    voice.lsax = voice.nax;
++                if ((flags & 0x01u) != 0u)
++                {
++                    m_spuEndx[core] |= 1u << slot;
++                    voice.nax = voice.lsax;
++                    if ((flags & 0x02u) == 0u)
++                        voice.active = false;
++                }
++                else
++                {
++                    voice.nax = (voice.nax + 16u) % kSpuRamBytes;
++                }
++            }
++            if (guard >= 65536u)
++                voice.fraction = 0u;
++        }
++    }
++
++    uint32_t IopMemory::spuOverride(uint32_t address, uint32_t stored) const
++    {
++        uint32_t core = 0u;
++        uint32_t reg = 0u;
++        if (!spuCoreRegister(address, core, reg))
++            return stored;
++        spuAdvance();
++        uint32_t result = stored;
++        for (uint32_t half = 0; half < 2u; ++half)
++        {
++            const uint32_t r = reg + half * 2u;
++            uint32_t value = (stored >> (half * 16u)) & 0xFFFFu;
++            if (r >= 0x1C0u && r < 0x1C0u + 24u * 0xCu)
++            {
++                const uint32_t slot = (r - 0x1C0u) / 0xCu;
++                const uint32_t field = (r - 0x1C0u) % 0xCu;
++                const SpuVoice &voice = m_spuVoices[core * 24u + slot];
++                if (field == 8u)
++                    value = (voice.nax >> 17u) & 0xFu;
++                else if (field == 10u)
++                    value = (voice.nax >> 1u) & 0xFFFFu;
++            }
++            else if (r < 24u * 0x10u && (r & 0xFu) == 0xAu)
++            {
++                // ENVX: la envolvente no se modela; vale 0 cuando la voz ha terminado
++                value = m_spuVoices[core * 24u + r / 0x10u].active ? 0x7FFFu : 0u;
++            }
++            else if (r == 0x340u)
++                value = m_spuEndx[core] & 0xFFFFu;
++            else if (r == 0x342u)
++                value = (m_spuEndx[core] >> 16u) & 0xFFu;
++            result = (result & ~(0xFFFFu << (half * 16u))) | (value << (half * 16u));
++        }
++        return result;
++    }
++
++    void IopMemory::spuWrite(uint32_t address, uint32_t oldValue, uint32_t value)
++    {
++        uint32_t core = 0u;
++        uint32_t reg = 0u;
++        if (!spuCoreRegister(address, core, reg))
++            return;
++        spuAdvance();
++        const uint32_t base = Spu2Base + core * kSpuCoreStride;
++        for (uint32_t half = 0; half < 2u; ++half)
++        {
++            const uint32_t r = reg + half * 2u;
++            const uint16_t now = static_cast<uint16_t>(value >> (half * 16u));
++            const uint16_t before = static_cast<uint16_t>(oldValue >> (half * 16u));
++            if (r == 0x1A0u || r == 0x1A2u || r == 0x1A4u || r == 0x1A6u)
++            {
++                // KON/KOFF actuan al escribirse; se guardan a 0 para que la escritura byte a byte no los repita
++                spuSetReg(base + r, 0u);
++                const uint32_t bits = r == 0x1A0u || r == 0x1A4u ? now : static_cast<uint32_t>(now & 0xFFu) << 16u;
++                for (uint32_t slot = 0; slot < 24u; ++slot)
++                {
++                    if ((bits & (1u << slot)) == 0u)
++                        continue;
++                    SpuVoice &voice = m_spuVoices[core * 24u + slot];
++                    if (r == 0x1A0u || r == 0x1A2u)
++                    {
++                        const uint32_t ssa = ((static_cast<uint32_t>(spuReg(base + 0x1C0u + slot * 0xCu)) & 0xFu) << 16u) |
++                                             spuReg(base + 0x1C2u + slot * 0xCu);
++                        voice.active = true;
++                        voice.nax = (ssa * 2u) % kSpuRamBytes;
++                        voice.fraction = 0u;
++                        voice.lsaxSet = false;
++                        voice.lsax = voice.nax;
++                        m_spuEndx[core] &= ~(1u << slot);
++                    }
++                    else
++                    {
++                        voice.active = false;
++                    }
++                }
++                continue;
++            }
++            if (now == before)
++                continue;
++            if (r >= 0x1C0u && r < 0x1C0u + 24u * 0xCu)
++            {
++                const uint32_t slot = (r - 0x1C0u) / 0xCu;
++                const uint32_t field = (r - 0x1C0u) % 0xCu;
++                if (field == 4u || field == 6u)
++                {
++                    SpuVoice &voice = m_spuVoices[core * 24u + slot];
++                    const uint32_t lsa = ((static_cast<uint32_t>(spuReg(base + 0x1C4u + slot * 0xCu)) & 0xFu) << 16u) |
++                                         spuReg(base + 0x1C6u + slot * 0xCu);
++                    voice.lsax = (lsa * 2u) % kSpuRamBytes;
++                    voice.lsaxSet = true;
++                }
++            }
++            else if (r == 0x340u || r == 0x342u)
++            {
++                m_spuEndx[core] = 0u;
++            }
++        }
++        if (reg == 0x1ACu)
++        {
++            // puerto de datos: escribe en TSA y avanza
++            const uint32_t tsa = ((static_cast<uint32_t>(spuReg(base + 0x1A8u)) & 0xFu) << 16u) | spuReg(base + 0x1AAu);
++            const uint16_t data = static_cast<uint16_t>(value);
++            const uint32_t byteAddress = (tsa * 2u) % kSpuRamBytes;
++            m_spuRam[byteAddress] = static_cast<uint8_t>(data);
++            m_spuRam[(byteAddress + 1u) % kSpuRamBytes] = static_cast<uint8_t>(data >> 8u);
++            const uint32_t next = (tsa + 1u) & 0xFFFFFu;
++            spuSetReg(base + 0x1A8u, static_cast<uint16_t>(next >> 16u));
++            spuSetReg(base + 0x1AAu, static_cast<uint16_t>(next));
++        }
++    }
++
++    void IopMemory::spuDmaTransfer(bool secondCore, uint32_t madr, uint32_t bytes, bool toSpu)
++    {
++        const uint32_t base = Spu2Base + (secondCore ? kSpuCoreStride : 0u);
++        const uint32_t tsa = ((static_cast<uint32_t>(spuReg(base + 0x1A8u)) & 0xFu) << 16u) | spuReg(base + 0x1AAu);
++        uint32_t spuAddress = (tsa * 2u) % kSpuRamBytes;
++        uint32_t ramAddress = physicalAddress(madr) % RamSize;
++        for (uint32_t i = 0; i < bytes; ++i)
++        {
++            if (toSpu)
++                m_spuRam[spuAddress] = m_ram[ramAddress];
++            else
++                m_ram[ramAddress] = m_spuRam[spuAddress];
++            spuAddress = (spuAddress + 1u) % kSpuRamBytes;
++            ramAddress = (ramAddress + 1u) % RamSize;
++        }
++    }
+ }
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+index a932a5d..f740398 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <cstddef>
++#include <array>
+ #include <cstdint>
+ #include <optional>
+ #include <span>
+@@ -22,7 +23,7 @@ namespace ps2x::iop::detail
+         static constexpr uint32_t Spu2End = 0x1FA00000u;
+         static constexpr uint32_t SifBase = 0x1D000000u;
+         static constexpr uint32_t SifEnd = 0x1D001000u;
+-        static constexpr uint32_t HeapBase = 0x00120000u;
++        static constexpr uint32_t HeapBase = 0x00010000u; // modulos y AllocSysMemory comparten el monton
+         static constexpr uint32_t HeapLimit = 0x001F0000u;
+ 
+         struct Allocation
+@@ -72,6 +73,9 @@ namespace ps2x::iop::detail
+ 
+         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
+ 
++        // Reloj del IOP (ciclos a 36,864 MHz) para avanzar las voces del SPU2.
++        void setCycleSource(const uint64_t *cycles) noexcept { m_cycleSource = cycles; }
++
+     private:
+         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
+         void writeHardware32(uint32_t address, uint32_t value);
+@@ -87,5 +91,29 @@ namespace ps2x::iop::detail
+         uint32_t m_interruptMask = 0;
+         uint32_t m_interruptControl = 1;
+         std::optional<DmaStart> m_dmaStart;
++
++        // Modelo minimo de las voces del SPU2: RAM de sonido (lo que llega por DMA o por el puerto de datos), y por voz
++        // la direccion actual (NAX), el bucle (LSAX) y ENDX, avanzados con el tono segun el reloj del IOP. No mezcla
++        // audio: basta para que el driver vea avanzar la reproduccion (posicion de los flujos, fin de sonidos).
++        struct SpuVoice
++        {
++            bool active = false;
++            uint32_t nax = 0;      // en bytes
++            uint32_t lsax = 0;     // en bytes
++            bool lsaxSet = false;
++            uint64_t fraction = 0; // muestras * 4096 pendientes dentro del bloque
++        };
++        void spuWrite(uint32_t address, uint32_t oldValue, uint32_t value);
++        void spuDmaTransfer(bool secondCore, uint32_t madr, uint32_t bytes, bool toSpu);
++        void spuAdvance() const;
++        [[nodiscard]] uint16_t spuReg(uint32_t address) const;
++        void spuSetReg(uint32_t address, uint16_t value) const;
++        [[nodiscard]] uint32_t spuOverride(uint32_t address, uint32_t stored) const;
++
++        const uint64_t *m_cycleSource = nullptr;
++        mutable std::vector<uint8_t> m_spuRam;
++        mutable std::array<SpuVoice, 48> m_spuVoices{};
++        mutable uint64_t m_spuLastCycle = 0;
++        mutable uint32_t m_spuEndx[2] = {0, 0};
+     };
+ }
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index e5f63a9..ffd79fa 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -110,6 +110,7 @@ namespace ps2x::iop::detail
+               imports(memory),
+               loadcore(memory, imports)
+         {
++            memory.setCycleSource(&totalCycles);
+             reset();
+         }
+ 
+diff --git a/ps2xIOP/src/emulator/services/iop_module_loader.cpp b/ps2xIOP/src/emulator/services/iop_module_loader.cpp
+index 80e59d6..9bd5eb6 100644
+--- a/ps2xIOP/src/emulator/services/iop_module_loader.cpp
++++ b/ps2xIOP/src/emulator/services/iop_module_loader.cpp
+@@ -431,8 +431,11 @@ namespace ps2x::iop::detail
+         int64_t delta = 0;
+         if (relocate)
+         {
+-            base = alignUp(moduleCursor, 0x100u);
+-            if (base + span >= IopMemory::HeapBase)
++            // El modulo se reserva en el mismo monton que AllocSysMemory, como hace loadcore con sysmem: con una
++            // zona fija para modulos y otra para el monton, el monton se quedaba en 832 KB y sobraba RAM sin usar.
++            (void)moduleCursor;
++            base = memory.allocate(span, 0x100u);
++            if (base == 0u)
+             {
+                 result.error = IopImageLoadError::ArenaExhausted;
+                 return result;

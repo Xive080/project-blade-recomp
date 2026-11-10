@@ -43,12 +43,22 @@ Propios:
   la pagina de 8 KB en una cache que solo se invalidaba con TEXFLUSH (podia quedar obsoleta si el juego subia o
   dibujaba en esa pagina sin TEXFLUSH) y, con texturas de varias paginas, repetia la copia en cada cambio de pagina: era
   el mayor coste del rasterizador en el menu (videos de fondo de 640x512 en 40 trozos).
+- `ps2recomp-iop-heap-spu2.patch`: memoria del IOP y SPU2 para el driver de audio (TSSDRV).
+  - Monton: `allocate` buscaba siempre a partir de un cursor que solo crecia, asi que lo liberado no se reutilizaba; ahora
+    busca el primer hueco libre (como `AllocSysMemory` en modo FIRST) y `maxFreeMemory` da el mayor hueco real. Ademas
+    los modulos IRX se cargaban en una zona fija (0x10000-0x120000) y el monton se quedaba en 0x120000-0x1F0000 (832 KB);
+    ahora los modulos se reservan en el mismo monton desde 0x10000, como hace loadcore con sysmem.
+  - SPU2: modelo minimo de voces. Guarda la RAM de sonido (DMA de los canales 4/7 y puerto de datos 0x1AC con TSA),
+    y por voz la direccion actual (NAX), el bucle (LSAX, o la bandera "loop start" del bloque ADPCM) y ENDX; KON/KOFF
+    arrancan y paran voces y el tono (PITCH) avanza NAX segun el reloj del IOP (48 kHz, 28 muestras por bloque de 16
+    bytes). ENVX vale 0x7FFF con la voz activa y 0 al acabar. No mezcla audio: sirve para que el driver vea avanzar la
+    reproduccion (posicion de los flujos via `sceSdGetAddr`, fin de los efectos).
 
 Herramientas propias (sin parche: `runner/blade_devtools.cpp`, solo se activan con variables de entorno):
 - `BLADE_DUMP_FRAMES=carpeta[,cada_N[,desde]]`: guarda en PNG la imagen presentada cada N VSync (`frame_TTTTTT.png`).
 - `BLADE_INPUT="300:START;420+20:CROSS;500:UP,CROSS"`: pulsa botones del mando 1 en VSync concretos
   (`TICK[+DURACION]:BOTONES`, duracion por defecto 6; tambien `LX=`/`LY=` para el stick izquierdo).
-- `BLADE_DUMP_RAM=carpeta,VSync`: guarda los 32 MB de RAM del EE en ese VSync.
+- `BLADE_DUMP_RAM=carpeta,VSync[,VSync...]`: guarda los 32 MB de RAM del EE en cada VSync indicado (`ram_TTTTTT.bin`).
 - `BLADE_EXIT_TICK=N`: cierra el proceso en el VSync N (pruebas sin ventana atendida).
 - Guion que llega hasta el modo historia: `BLADE_INPUT="300:START;400:START;500:START;600:START;700:START;900:CROSS;1050:CROSS;1200:CROSS;2250:CROSS;2400:CROSS"`.
 
@@ -97,25 +107,38 @@ Herramientas propias (sin parche: `runner/blade_devtools.cpp`, solo se activan c
   patrocinadores), pantalla de titulo "Press START", menu principal, seleccion de partida (la tarjeta de memoria
   funciona: crea y guarda GAME1 en `mc0`, autoguardado en la ranura 1), un jugador, modo historia, CONTINUE, pantalla de
   carga "hideaway" limpia y carga del primer nivel (TSSDRV carga los efectos: board, jump, kickflip...). El nivel 3D
-  se dibuja (cielo, suelo, decorado, letrero LOADING) pero la pantalla queda negra: ver Pendiente.
+  se dibuja (cielo, suelo, decorado, letrero LOADING); la pantalla quedaba negra hasta el bloqueo 7.
 - El VSync del runtime sale de ciclos EE contados, no del reloj: en este Mac van unos 8-13 VSync por segundo real.
-- Pendiente 1 (nivel negro): cada imagen termina con 20 sprites negros sin textura `rgba=0,0,0,126` con mezcla
-  `ALPHA=0x44` ((Cs-Cd)*As+Cd) sobre la zona 3D: un fundido a negro al 98 % que no avanza en mas de 1 000 VSync
-  (comprobado quitando esos sprites en el GS: debajo esta la escena, con la camara quieta). El juego espera algo antes
-  de abrir el fundido. Candidato: el audio. TSSDRV (servidor RPC 0x701, se ejecuta en el IOP emulado) contesta siempre
-  a la llamada de estado 0x8018 (una por VSync, 384 bytes) con todo ceros desde el menu, y el EE nunca le manda
-  comandos (paquete de 32 bytes, contador a 0 en 0x3176B0); en el nivel, el nombre de flujo que viaja en ese paquete es
-  `L1\E\L1C...` (posible voz o musica de la escena de entrada). Siguiente paso: localizar quien lee esa respuesta y
-  el contador del fundido (buscar en RAM la variable que da el 252 de RenderWare = 126 en el GS).
+- Bloqueo 7 (resuelto, nivel negro): el fundido a negro del nivel (20 sprites `rgba=0,0,0,126`, `ALPHA=0x44`) espera a
+  que avance el flujo de audio de la escena de entrada. TSSDRV (servidor RPC 0x701) abre los flujos con
+  `TssStreamsOpen` y escribe su estado en el EE (0x317540, 8 entradas {estado, tiempo en ms}) por SIF DMA; el flujo del
+  nivel quedaba en estado 2 (fallo al abrir) porque `RwaStreamOpen` no podia reservar su buffer (0x40000 bytes) en el
+  monton del IOP: el monton no reutilizaba lo liberado y solo tenia 832 KB. Arreglado en el IOP emulado (sin HLE), parche
+  `ps2recomp-iop-heap-spu2.patch`: monton de primer hueco libre compartido con los modulos. Con eso los dos flujos se
+  abren ("RwaStreamOpen : Opened and prepared") y el fundido se abre. El tiempo del flujo sale de la posicion de la voz
+  en el SPU2 (`RwaVoiceGetWavePos` -> `sceSdGetAddr`, NAX), que no existia: el mismo parche anade un modelo minimo de
+  voces del SPU2 y el tiempo avanza a ritmo real (12,6 s en el VSync 3000, 21,0 s en el 3500).
+- Ahora: la escena de entrada del nivel 1 se ve y la camara recorre el escenario (escalera, pasillo, puerta con carteles),
+  con barras de cine y el letrero LOADING abajo. Sigue igual en el VSync 5200 (unos 2 800 VSync despues de entrar), asi
+  que aun no se llega a controlar al personaje.
+- Pendiente 1: la entrada no termina (LOADING fijo durante todo el recorrido). Falta ver que espera el juego para dar paso
+  al control: fin del flujo de audio (estado del flujo en 0x317540 al llegar al final del fichero, ENDX de la voz con el
+  ultimo bloque), lecturas de CD pendientes de GTFSCDVD o el boton para saltar la escena. La banda superior (filas
+  0-95, bajo la barra de cine) muestra texturas: es el mismo solape de VRAM que el menu (Pendiente 2).
 - Pendiente 2 (menu corrupto): cada imagen el menu sube el video de fondo (MENUBASE.M2V, 640x512) como 40 trozos CT32
   de 128x64 en los bloques 1536..6655 y las fuentes detras (hasta ~8032), pero los buffers de pantalla estan en las
   paginas 160 y 320 (bloques 5120 y 10240) y el Z en la 480 (Z16S, 80 paginas, da la vuelta a 0-47). Los trozos 28-39 y
   las fuentes caen dentro del buffer de la pagina 160 y se pisan con el dibujo: bloques del video viejos arriba y una
-  banda de basura de fuentes. El hueco libre real son las paginas 48-159. Falta ver por que la cache de texturas de
+  banda de basura de fuentes. Traza de las subidas (TRXDIR): todas son `dbw=2` (128 de ancho), CT32, trozos de 128x64
+  (128 bloques cada uno) de 1536 a 6528, y luego 6656 (128x128), 6912/7456/8000 (16x16) y 6944/7488 (128x256): el propio
+  juego pide esas direcciones, el runtime no las mueve. El hueco libre real son las paginas 48-159. Falta ver por que la cache de texturas de
   RenderWare no vuelve al principio en el limite (hipotesis: calcula el limite con buffers de 640x256). El intercambio de
   buffers (`sceGsSwapDBuffDc`) es correcto (igual que la libgraph del juego en 0x101B30).
-- Pendiente 3: rendimiento (rasterizador por CPU: muestreo de texturas y escritura de pixel), y comprobar que se oye
-  el audio de LIBSD/TSSDRV.
+- Pendiente 3: rendimiento. En el nivel van unos 6 VSync por segundo real (14 en el menu). Perfil de 10 s con `sample`
+  durante la entrada: el rasterizador por CPU (`SampleTexture` + `WritePixel` + `Submit` + `ReadTexture`, unas 4 900
+  muestras) y el interprete de VU1 (`commitReadyPipelines`, `calculatePairReadyCycle`, `execUpper`..., unas 2 800) se
+  llevan casi todo; el codigo recompilado del EE apenas aparece. El SPU2 del IOP no mezcla audio, asi que no se oye la
+  musica ni los efectos de LIBSD/TSSDRV.
 - Metodo tomado de [hctp-recomp](https://github.com/BigDaddyJRich/hctp-recomp) (WWE SmackDown! HCTP con PS2Recomp:
   Ghidra + emotionengine-reloaded + inicios recuperados), que tambien ejecuta los IRX propios del juego.
 - Otras funciones de libcdvd sin nombre en el mismo bloque (0x113070, 0x1132A8, 0x113340, 0x113470, 0x1137D8, 0x113AF0): si

@@ -45,3 +45,8 @@ Serie de 16 parches (con z-deterministic y el z-spu2-mixer nuevo de dev 3) aplic
 
 ## Recertificacion dev 2 (ronda 2): vu1-record / vu1-z-compiled
 QA PASSED con evidencia: serie de 19 parches (los 16 propios + vu1-profile, vu1-record, vu1-z-compiled de dev 2) aplica limpia sobre e563698 en un clon nuevo; reconstruccion completa de build/qa (3978 unidades) enlazada sin shims; replay 20000/20000 y 6000/6000 identicas con el interprete y con el codigo compilado; prueba negativa detecta exactamente las llamadas 2964 y 2965. Rendimiento en docs/PERFORMANCE_BASELINE.md. No verificado: que el codigo compilado sea correcto fuera de lo cubierto por las grabaciones (634559 pares caen al interprete en vu1b).
+
+## Certificacion de ps2recomp-z-gs-fastpath (dev 2, ronda 3)
+- QA PASSED: aplica limpio sobre la serie de 19 parches en un clon nuevo de e563698 (20 parches); build incremental de mi arbol (25 unidades) enlazado sin shims.
+- QA PASSED (equivalencia visible y de RAM): ejecucion determinista hasta VSync 3950 con el guion de la linea base. Con el parche (ruta rapida por defecto) y con `PS2X_GS_LEGACY=1` (control): 78/78 hashes de RAM y de fotograma identicos a la referencia previa al parche (qa/det/A) y 79/79 PNG identicos byte a byte. 207 s la ruta rapida y 242 s la antigua, ambas a la vez en la misma maquina (orientativo).
+- UNVERIFIED (rendimiento): no hay ventana de maquina libre. Carga durante las medidas 12-130 (otros agentes compilando); partida 11,0 (rapida), 11,8 (antigua) y 15,6 V/s (rapida, 2a vez): ruido mayor que cualquier diferencia. Repetir con la maquina en reposo.

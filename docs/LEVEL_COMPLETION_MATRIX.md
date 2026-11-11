@@ -16,3 +16,23 @@ Casillas: OK (visto en captura propia), PARCIAL, FALLA, UNVERIFIED (no probado p
 | Trucos / puntuacion (CUADRADO suma 200) | UNVERIFIED por QA (afirmacion del dev) | UNVERIFIED | UNVERIFIED | UNVERIFIED | -- | no probado |
 | Fin del nivel 1 / puntuacion final / guardar | UNVERIFIED | UNVERIFIED | UNVERIFIED | UNVERIFIED | UNVERIFIED | no alcanzado |
 | Niveles 2-N, entrenamiento, multijugador, extras | UNVERIFIED | UNVERIFIED | UNVERIFIED | UNVERIFIED | UNVERIFIED | no probado |
+
+## Intento de completar el nivel 1 (modo determinista, 11000 ticks)
+
+Ejecucion: `qa/blade_recomp.fp` (rama integracion, serie de 20 parches), `PS2X_DETERMINISTIC=1`, oculto, un solo proceso. Guion `BLADE_DET_INPUT`: START/X hasta el nivel y despues, desde el tick 3000, stick adelante (LY=0) sostenido y X cada 400 ticks. Volcado de captura y hash cada 100 ticks desde 2500 (`BLADE_DET_DUMP`, `BLADE_DET_HASH`). Guion completo en `qa/lvl1/script.txt` (no versionado), log en `qa/lvl1/run.log`, hojas de contacto `qa/lvl1/lvl1_sheet.png` (2500-11000) y `qa/lvl1/lvl1_end.png` (9800-10900).
+
+Resultado: el nivel 1 NO se completo. No hay cuelgue ni caida; el motivo es de juego, no de ejecucion.
+
+| Hecho | Estado | Evidencia |
+|---|---|---|
+| El proceso llega a 11000 ticks sin parar | OK | run.log, `[det] tick 11000` |
+| Errores del runtime (guest-branch, missing-target, Unimplemented, Syscall TODO, Segmentation, abort) | OK: 0 apariciones | grep sobre run.log |
+| Hash de frame distinto en cada muestra (no hay imagen congelada) | OK | 91 muestras 2500-11000, ninguna igual a la anterior |
+| Cronometro del nivel baja de 2:29 (tick 2500) a 0:01 (tick 9900), rojo desde ~0:09 | OK | lvl1_sheet.png, lvl1_end.png |
+| Jugador visible | PARCIAL: solo en tick 3000 (junto al camion); desde 3500 la camara queda pegada a una pared de ladrillo, sin personaje a la vista | lvl1_sheet.png |
+| Puntuacion | UNVERIFIED que suba: se queda en 00000000 en todas las muestras (el guion no realizo trucos reales) | lvl1_sheet.png |
+| Avance por el nivel | FALLA/UNVERIFIED: la camara se desplaza pero el guion ciego no lleva al jugador a ningun objetivo; no se puede distinguir fallo del port de fallo del guion | lvl1_sheet.png |
+| Fin por tiempo: pantalla negra (tick ~10000, "CONTINUE"), "game over" con RESTART/QUIT, menu "quit game" | OK (flujo de fin de partida funciona y responde a X) | frames 10000-11000 |
+| Nivel 2 y siguientes | UNVERIFIED: no alcanzados | -- |
+
+Divergencia exacta: ninguna detectada por hash ni por log. Limite del intento: sin ver el jugador a partir del tick 3500 no se puede afirmar si el personaje no se mueve (entrada/animacion, relacionado con AB-004: sin tabla) o si esta oculto por la camara. Siguiente paso necesario: comparar en PCSX2 la misma entrada y ticks 3500-4500 para ver si el jugador aparece, y localizar un guion que supere el nivel (requiere mirar el juego, no ciego).

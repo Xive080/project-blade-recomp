@@ -36,3 +36,18 @@ Resultado: el nivel 1 NO se completo. No hay cuelgue ni caida; el motivo es de j
 | Nivel 2 y siguientes | UNVERIFIED: no alcanzados | -- |
 
 Divergencia exacta: ninguna detectada por hash ni por log. Limite del intento: sin ver el jugador a partir del tick 3500 no se puede afirmar si el personaje no se mueve (entrada/animacion, relacionado con AB-004: sin tabla) o si esta oculto por la camara. Siguiente paso necesario: comparar en PCSX2 la misma entrada y ticks 3500-4500 para ver si el jugador aparece, y localizar un guion que supere el nivel (requiere mirar el juego, no ciego).
+
+## Contraste con PCSX2 y comprobacion del mando (ronda siguiente)
+
+PCSX2 2.9.168 (Rosetta), ISO propia de solo lectura, DualShock2 con W = stick izquierdo arriba, K = Cruz, Return = Start. Flujo: Start, "single player", "continue without saving", "story mode", carga hideaway, X.
+
+| Hecho | Estado | Evidencia |
+|---|---|---|
+| En PCSX2 el jugador SI se dibuja (de espaldas, camiseta blanca, pantalon verde, mochila amarilla, sobre la tabla roja con sombra) | OK | primera captura del nivel, cronometro 2:21,88; capturas 2:13-1:25 |
+| En PCSX2 el stick adelante (W mantenido) mueve al jugador por el nivel: de la plaza al cartel CLARKES (cronometro 1:35-1:25) | OK | hoja de capturas posterior en la carpeta de trabajo (no versionada) |
+| En el puerto el jugador no aparece cerca de la camara en ningun tick 3000-11000 (figura de pantalon verde solo a media distancia, sin tabla) | FALLA (AB-004, CONFIRMADO) | qa/lvl1/lvl1_sheet.png, qa/lvl2/lvl2_sheet.png |
+| El stick llega al juego en el puerto: volcado de RAM del tick 3150 (stick arriba desde 3095) tiene 4 bloques de lectura de mando con modo 0x73 (DualShock2 analogico), botones 0xFFFF, rx=0x80 ry=0x80 lx=0x80 **ly=0x00** | OK | `qa/lvl3/ram/ram_003150.bin` (no versionado), offsets 0x2fa708, 0x2fa8c8, 0x306c08, 0x306dc8; el juego pide el modo analogico (`scePadSetMainMode`) y el puerto lo concede |
+| Misma imagen con stick (LY=0) y con cruceta (UP) en los ticks 3000-3200; difieren desde 3300 | UNVERIFIED que la entrada mueva al jugador: hasta ~3200 el nivel parece guionizado (introduccion), y desde 3208 el guion con stick pulsa ademas X, asi que no es comparacion limpia | hashes de frame de `qa/lvl1/run.log` y `qa/lvl2/run.log`; los hashes de RAM si difieren entre ambas entradas desde el tick 3100 (la entrada llega a RAM) |
+| Primer punto de divergencia puerto/PCSX2 | El jugador no se dibuja (AB-004): impide ver si avanza. No se detecta fallo del mando | -- |
+
+Siguiente paso propuesto (no hecho): volcar RAM del puerto con y sin stick en dos ticks y buscar la posicion del jugador (flotantes que cambian) para saber si el personaje avanza aunque no se dibuje; y revisar por que no se dibuja el modelo del jugador/tabla (AB-004).

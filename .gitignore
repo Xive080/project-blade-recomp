@@ -8,3 +8,10 @@ build/
 build-*.log
 third_party/
 .DS_Store
+# Salidas de QA y del generador del VU1: nunca versionar discos, binarios, capturas, audio, grabaciones ni codigo generado
+qa/
+work/vu1gen/
+*.rec
+*.wav
+*.bin
+*.png

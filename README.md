@@ -7,6 +7,9 @@ Simbolos, matching y notas del motor (RenderWare): repo hermano `project-blade-d
 
 ## Reglas
 - No se versiona el ELF, el disco ni el codigo generado: se produce en local desde el disco del propio usuario.
+- El C++ generado a partir del microcodigo VU1 del disco es codigo del juego: no se versiona (ni en `patches/`).
+  Solo se versiona el generador; la salida va a `work/vu1gen/` (ignorada) y se produce al compilar desde el disco del
+  usuario. Del microcodigo solo se guardan hashes, nunca su contenido.
 - Sin rutas absolutas.
 - PS2Recomp es una dependencia externa (GPL-3.0) que se clona en `third_party/` con el commit fijado; nuestros cambios van en `patches/`.
 
@@ -94,16 +97,67 @@ Propios:
     (`nearbyintf`). 287 usos.
   - Macros de VU0: `VDIV`/`VSQRT`/`VRSQRT` con la aritmetica de la FPU (divisor cero = +-max, raiz de |ft|) en vez de
     dar 0; `VRSQRT` calcula fs/sqrt(ft) (antes 1/sqrt(ft), ignoraba fs).
+- `ps2recomp-mmi-permute.patch`: permutaciones MMI del R5900 (runtime + traductor). `PEXEW` intercambiaba las palabras
+  por pares (0<->1, 2<->3) en vez de 0<->2; igual de mal `PROT3W`, `PEXCW`, `PEXEH`, `PEXCH`, `PREVH` (invertia los 8
+  medios en vez de cada mitad de 64 bits), `PINTH` y `PINTEH`. Ahora todas son macros `PS2_*` de `ps2_runtime_macros.h`
+  con la definicion del manual del EE (como PCSX2), comprobadas con un test. En AirBlade solo se usa `PEXEW` (10 veces),
+  que ya iba por macro: el codigo generado no cambia, basta recompilar.
 - `ps2recomp-dispatch-unwind.patch`: `dispatchGuestBranch` tomaba "el llamado vuelve con pc == su entrada" por "volvio
   sin tocar pc" y seguia en la vuelta. Con una llamada recursiva (A -> ... -> jalr A) interrumpida justo en la entrada
   interna por un punto seguro del planificador, el pc es la entrada de A y el llamador externo seguia con el sp y el ra
   del marco interno: salto a la pila (0x1FFF990) y el hilo principal moria. Ahora una marca indica que se esta
   deshaciendo la pila hacia el planificador y los llamadores devuelven `false` hasta llegar a el.
+- `ps2recomp-pal-vblank.patch`: VBlank a 50 Hz en modo PAL. El planificador del EE fijaba el VBlank a 60 Hz (16 667 us,
+  ciclos de NTSC) y el `vblank.irx` del IOP (`WaitVblankStart/End`, que usan PADMAN y TSSDRV) tambien. El juego pide PAL
+  por el stub HLE `sceGsResetGraph` (omode 3), no por la llamada `SetGsCrt`; los dos llaman ahora a
+  `EeScheduler::setVideoMode`, que pasa el VBlank del EE a 20 000 us (y sus ciclos) y el del IOP a `kIopClockHz/50`. La
+  salida avisa una vez con `[ee] modo de video PAL: VBlank a 50 Hz`. Se corrige tambien el comentario de `SetGsCrt`
+  (2 = NTSC, 3 = PAL). El reloj del nivel cuenta 1 VSync = 1/50 s, asi que antes corria un 20 % deprisa respecto al real.
+- `ps2recomp-vu1-profile.patch`: solo medida (sin efecto si no se define `PS2X_VU1_PROFILE`); ver Herramientas.
+- `ps2recomp-vu1-commit-once.patch`: dos recortes del interprete VU1 sin cambiar el resultado. `commitReadyPipelines`
+  se llamaba al principio de cada instruccion aunque `advanceOneCycle` ya lo habia hecho en el mismo ciclo (ahora una
+  vez antes del bucle) y `updateFmacFlags` buscaba hueco en la cola de banderas recorriendo las 8 entradas (ahora el
+  primer bit libre de `m_flagMask`, el mismo hueco).
+- `ps2recomp-vu1-record.patch`: grabador/reproductor del VU1 (red de seguridad para cualquier cambio del interprete o
+  para el recompilador). Solo anade `friend struct VU1Internal;` a `ps2_vu1.h` (cambia una cabecera: recompilacion
+  completa) y codigo en `ps2_vu1_core.cpp`; sin efecto si no se define `PS2X_VU1_RECORD`. Ver Herramientas.
+- `ps2recomp-vu1-z-compiled.patch` (se aplica despues de `ps2recomp-vu1-record.patch`; por eso la `z`): microprogramas
+  del VU1 compilados. El cuerpo del bucle de `VU1Interpreter::run` pasa a `stepPairT<Gen>` (`ps2_vu1_step.inc`) y los
+  cuerpos de `execUpper`/`execLower` y de las banderas FMAC a plantillas en linea (`ps2_vu1_upper.cpp`,
+  `ps2_vu1_lower.cpp`, `ps2_vu1_fmac.inc`); el interprete usa `Gen=false` y `ps2_vu1_gen.cpp` instancia el mismo paso
+  con `Gen=true`, el par de instrucciones y su decodificacion como constantes de compilacion. Mismo codigo, asi que
+  estado, ciclos, banderas MAC/estado, Q/P y XGKICK son los del interprete por construccion; el replay lo comprueba.
+  Sin fichero generado (`PS2X_VU1GEN_FILE` vacio) el resultado es el interprete de siempre.
+
+- `experimental/ps2recomp-vu1-gs-handoff.patch`: EXPERIMENTAL, no forma parte de la serie por defecto (no esta en
+  `patches/`; se aplica a mano sobre la serie). Reutiliza las ranuras de la cola y agrupa primitivas en `runChunk`
+  (solo `gs_threaded_backend.{h,cpp}`). Sin verificacion bit a bit valida (ver `PS2X_GS_VERIFY` en Herramientas) y sin
+  ganancia medible (A/B con carga 5-11: dentro del ruido), asi que no se entrega.
+- `ps2recomp-z-deterministic.patch`: modo determinista del planificador del EE (`EeScheduler.cpp`), solo con
+  `PS2X_DETERMINISTIC=1`; sin la variable no cambia nada. Sin ritmo de reloj de pared (los plazos se cumplen por ciclos
+  del EE) y con un gancho `ps2xQaVSyncHook` que se llama en el hilo del EE al empezar cada VBlank. Se aplica despues de
+  `ee-idle-iop` y `pal-vblank` y antes de `z-spu2-mixer`. Lo usa `runner/qa_deterministic.cpp`.
+- `ps2recomp-z-spu2-mixer.patch`: mezclador SPU2 real en el emulador del IOP (aplicar el ultimo; toca la misma zona del
+  bucle del IOP que `vu1-fast`). Decodificador ADPCM (16 bytes/28 muestras), 48 voces con tono, ADSR, volumen, bucle y
+  ENDX, mezcla a 48 kHz con volumenes maestros y reverb (anillo de la RAM del SPU2), todo sincronizado con el reloj del
+  IOP (una muestra cada 768 ciclos), no con el VSync. Entrega el audio por `ps2x::iop::setSpu2Sink`. DSP aislado en
+  `spu2_dsp.h` con tests (`ps2_iop_spu2_dsp_tests`, `ps2_iop_spu2_mix_tests`). Depuracion: `PS2X_SPU_TRACE=fichero`,
+  `PS2X_SPU_REVERB=0`, `PS2X_SPU_RAMDUMP=fichero`, `PS2X_SPU_MASTER=strict`. Estado y desviaciones en
+  `docs/AUDIO_IMPLEMENTATION_STATUS.md`.
 
 Arreglos del juego (sin parche, en `runner/blade_overrides.cpp`):
 - Cache de texturas de RenderWare (0x1F39E0): en el modo de video 38 (640x512, entrelazado + FSAA) el driver calcula el
   inicio de la cache pasado el final de los 4 MB y un tamano negativo; el override da la vuelta al inicio (pagina 48) y
   acaba la cache donde empieza el primer buffer de dibujo (pagina 160). Ver "Pendiente 2" en Estado.
+- Espera de la cola de RenderWare sky2 (0x1DF500): con el DMA del VIF1 ocupado, el hilo principal da vueltas a
+  `while (hechos + 1 < encolados)` llamando a 0x111A70/0x111AB8 (DI/EI) y cada vuelta pasaba por
+  `EeScheduler::checkpointDue` (IOP, temporizadores): ~30 % del hilo del EE en el nivel. El override hace la misma
+  espera en C++: si el driver esta ocupado (gp-0x7930, gp-0x79D0 o gp-0x79CC) adelanta el tiempo en pasos de 1 024
+  ciclos (o hasta el siguiente temporizador del EE, lo que llegue antes) hasta que haya una interrupcion u otro evento
+  y vuelve a mirar; si no, llama al lanzador 0x1DEE30 como el original. Sustituye tambien las etiquetas de reanudacion
+  (0x1DF514, 0x1DF540, 0x1DF550, 0x1DF570). Con pasos de 4 096 ciclos o mas el video de fondo del menu perdia
+  imagenes (a 32 768 se quedaba en el titulo); con 1 024 + tope del temporizador se ve igual que sin override.
+  `BLADE_NO_SKYWAIT=1` lo desactiva.
 
 Herramientas propias (sin parche: `runner/blade_devtools.cpp`, solo se activan con variables de entorno):
 - `BLADE_DUMP_FRAMES=carpeta[,cada_N[,desde]]`: guarda en PNG la imagen presentada cada N VSync (`frame_TTTTTT.png`;
@@ -117,7 +171,112 @@ Herramientas propias (sin parche: `runner/blade_devtools.cpp`, solo se activan c
   de los semaforos (`[blade:kernel]`); con `sp` se recorre la pila en el volcado.
 - `BLADE_EXIT_TICK=N`: cierra el proceso en el VSync N (pruebas sin ventana atendida).
 - `BLADE_HIDDEN=1`: ventana oculta y sin foco (pruebas en segundo plano; los PNG se siguen guardando).
+- `BLADE_STATS=1`: escribe una vez por segundo real `[blade:stats] VSync <tick> <VSync por segundo>` (medidas de
+  rendimiento; a velocidad completa son 50 en PAL) y, justo antes, `[blade:frames] 1s n=.. media .. min .. p1% ..`
+  con los tiempos de fotograma de ese segundo (ms reales entre VSync; si el tiempo avanza a saltos, el salto se reparte;
+  p1% = el percentil 99 de los tiempos, el 1 % de fotogramas mas lentos). Al salir con `BLADE_EXIT_TICK` escribe
+  `[blade:frames] total`.
+- `PS2X_VU1_PROFILE=1` (parche `ps2recomp-vu1-profile.patch`): perfil de los microprogramas del VU1 por (direccion de
+  arranque, hash del microcodigo): llamadas, reanudaciones, ciclos, tiempo y pares distintos ejecutados. Escribe un
+  informe acumulado (`[vu1prof] ===== informe`) cada 30 s reales; la diferencia entre dos seguidos da ese tramo.
+- `PS2X_VU1_RECORD=ruta[,desde[,cuantas]]` (parche `ps2recomp-vu1-record.patch`): graba, por cada llamada al VU1
+  (`execute`/`resume`) a partir de la llamada `desde`, el estado de entrada (registros, pipelines, deltas de la
+  memoria de datos) y los hashes de salida: estado final, ciclos, memoria de datos, paquetes GIF (hash y numero) del
+  XGKICK. `BLADE_VU1_REPLAY=ruta` (runner) reproduce el fichero en un `VU1Interpreter` limpio y un GS ficticio sin
+  arrancar el juego y compara todo bit a bit; sale con codigo distinto de 0 si algo difiere. Un fichero de 6 000
+  llamadas del nivel 1 (desde la 1 345 000) se reproduce en 0,6 s. Es la prueba que debe pasar cualquier recompilador
+  de microprogramas antes de fiarse de el.
+- `PS2X_GS_VERIFY=1|2` (parche experimental `experimental/ps2recomp-vu1-gs-handoff.patch`): diagnostico, no oraculo. Ejecuta los mismos trozos
+  en un `GSCpuBackend` sombra y compara la VRAM en cada Sync/Present. Limitacion conocida: da diferencias incluso con
+  `=2` (dos sombras entre si, mismo hilo) y con el paso de primitivas antiguo, asi que no vale como prueba de
+  igualdad; ver el informe de rendimiento.
+- `BLADE_VU1_REPLAY_REPEAT=N`: con `BLADE_VU1_REPLAY`, repite el fichero N veces para medir tiempos (solo se comparan
+  los resultados de la primera pasada). La cache de pares decodificados funciona como en el juego.
+- Microprogramas VU1 compilados (parche `ps2recomp-vu1-z-compiled.patch`). El C++ generado a partir del microcodigo del
+  disco es codigo del juego: NO se versiona (`work/vu1gen/`, ignorado) y se produce desde tu propio disco:
+  1. Graba llamadas del nivel con el interprete puro: `PS2X_VU1_NOGEN=1 PS2X_VU1_RECORD=work/vu1gen/nivel.rec,1500000,20000`
+     (con el guion de abajo).
+  2. Genera: `BLADE_VU1_GEN=work/vu1gen/nivel.rec:work/vu1gen:0-1f00 build/<dir>/blade_recomp disc/SCES_502.46`
+     (carpeta de salida y tramo de microcodigo en bytes, hex; `PS2X_VU1_PROFILE=1` con el replay lista los tramos
+     ejecutados). Escribe `vu1gen_unit_N.inc` (un trozo de 512 bytes cada uno: una unidad de compilacion por trozo) y
+     `vu1gen_table.inc`. Cada `case` lleva la decodificacion del propio interprete y la clave de 8 bytes del par. Si
+     la grabacion tiene imagenes de microcodigo distintas, genera una variante por imagen (las `BLADE_VU1_GEN_IMAGES`
+     mas usadas, 2 por defecto).
+  3. Configura y compila: `cmake -DPS2X_VU1GEN_DIR=<ruta absoluta a work/vu1gen> build/<dir>` y `cmake --build`. Las
+     unidades se compilan en paralelo (unos 3 min con `-j4` y el Mac muy cargado; en una sola unidad eran 25 min).
+     Hay que volver a configurar despues de generar.
+  En ejecucion cada `case` compara los 8 bytes del par con el microcodigo real; si no coinciden, o el PC sale de lo
+  generado, ejecuta ese par con el interprete (`PS2X_VU1_NOGEN=1` desactiva todo el codigo compilado; al final de
+  `BLADE_VU1_REPLAY` se cuentan los pares interpretados). Validacion: `BLADE_VU1_REPLAY` debe dar todas identicas.
+- `scripts/check_patches.sh`: aplica `patches/` (en orden) a un arbol limpio de e563698 y comprueba que
+  `third_party/PS2Recomp` es identico; es lo que garantiza que se compila y enlaza desde e563698 + patches + runner/
+  sin cambios locales.
+- Modo determinista (parche `ps2recomp-z-deterministic.patch`, `runner/qa_deterministic.cpp`; detalle en
+  `runner/README_DETERMINISTIC.md`): `PS2X_DETERMINISTIC=1` quita el ritmo de reloj de pared; `BLADE_DET_INPUT` (misma
+  sintaxis que `BLADE_INPUT`, pero tick de VSync exacto), `BLADE_DET_DUMP=carpeta,cada_N[,desde]` (PNG),
+  `BLADE_DET_HASH=cada_N[,desde]` (FNV-1a de la RAM del EE y del fotograma) y `BLADE_DET_EXIT=N`. Dos ejecuciones iguales
+  dan RAM y fotogramas identicos bit a bit (comprobado hasta el VSync 3950 y con el audio hasta 5300). La entrada anclada
+  al VSync (`BLADE_DET_INPUT`) ya reproduce los mismos ticks tambien en modo normal. Regresion: `scripts/qa_regression.sh`
+  (referencias propias, no versionadas) y analisis de audio en `scripts/qa_wav.py`.
+- `BLADE_AUDIO=0`: sin salida de audio. `BLADE_AUDIO_DUMP=ruta.wav`: escribe el audio mezclado en un WAV estereo 48 kHz
+  (sin altavoces; `runner/blade_audio.cpp`). Sin ninguna de las dos, el runner reproduce por raylib.
 - Guion que llega hasta el modo historia: `BLADE_INPUT="300:START;400:START;500:START;600:START;700:START;900:CROSS;1050:CROSS;1200:CROSS;2250:CROSS;2400:CROSS"`.
+  Con la tarjeta `mc0` que ya tiene la partida (`BESCES-50246000`) y 50 Hz, la partida del nivel 1 empieza hacia el
+  VSync 3500.
+
+## VU1 compilado: pasos 1 y 2 (2026-11-11)
+
+Hecho: plantilla por par (`stepPairT<Gen>`), generador (`BLADE_VU1_GEN`), guarda por par con caida al interprete,
+trozos de 512 bytes en unidades de compilacion separadas, variantes por imagen, fichero generado fuera del repo.
+Cubre los pares 0x0-0x1f00 (992 pares: las entradas 0x1810, 0x000 y 0x1ee0 y sus subrutinas; el juego carga 5
+imagenes distintas en ese tramo y se generan las 2 mas usadas, ~90 % de las llamadas).
+
+Evidencia (replay; el interprete puro es el oraculo; el tiempo del replay cambia poco con la carga porque es un solo
+hilo, pero se midio con el Mac cargado: 30-150):
+- `vu1.rec` (6 000 llamadas) y `vu1b.rec` (20 000 llamadas de otra ventana, grabada con `PS2X_VU1_NOGEN=1`): todas
+  identicas en estado, ciclos, memoria de datos y paquetes GIF, con el codigo compilado activo y sin el. La prueba
+  negativa (`vu1_bad.rec`) detecta las 2 llamadas corruptas con el codigo compilado.
+- Tiempo: `vu1b.rec` 1,67 s -> 0,97 s (x1,72); `vu1.rec` 0,50 s -> 0,29 s (x1,72). Con una sola imagen y una sola
+  unidad eran x1,5 (80 % de los pares compilados); ahora el 97 % de los pares va compilado.
+- Perfil del replay con el codigo compilado (`sample`, 3 400 muestras del hilo): trozos compilados 62 % (plano: no hay
+  un punto caliente, es el numero de instrucciones por par y la huella de codigo), `commitReadyPipelinesSlow` 16 %,
+  `progressXgkick` 10 % (incluye el hash FNV byte a byte de los paquetes GIF, que es coste del replay y no del juego),
+  `advanceOneCycle` 6 %, interprete (pares fuera de lo generado) ~4 %. Del tiempo del replay, parte es del propio
+  replay (hash de la memoria de datos y de los paquetes): descontandola, el VU1 sube ~x1,85.
+- En el juego (nivel 1, VSync >= 3650, 2 pasadas por modo, carga del Mac 15-25, misma binaria con `PS2X_VU1_NOGEN=1`
+  frente a codigo compilado): 15,4 y 15,5 V/s sin compilado; 23,1 y 23,3 V/s con el (x1,5). Tiempos de fotograma de
+  toda la pasada (4 100 VSync, desde el arranque): media 53,4 / 53,2 ms sin compilado y 38,0 / 37,7 ms con el; minimo
+  2,3-3,1 / 1,4-2,7 ms; p1% 155,1 / 153,0 ms y 113,6 / 105,6 ms. El objetivo (50 V/s) sigue lejos.
+- Meta del coordinador: x3. No alcanzada. Lo que falta es reducir el coste fijo de cada par (cola de banderas MAC/
+  estado/clip por FMAC, contadores de ciclo, escrituras de VF/VI con comprobacion), no mas cobertura de pares.
+
+## Plan B / diseno propuesto: VU1 en hilo propio (2026-11-11, NO implementado)
+
+Hoy el VU1 corre sincrono dentro del DMA de VIF1 en el hilo del EE (`processPendingTransfers` -> `processVIF1Data` ->
+callbacks MSCAL/MSCNT). Estudio (sin codigo) para ejecutarlo en un hilo "VIF1+VU1", productor-consumidor:
+
+- Mediciones del nivel 1 (3 200 ticks, maquina cargada): 0 accesos del EE a la memoria o al microcodigo del VU1; 665
+  lecturas de registros VIF1 en total (~0,2 por tick); ~52 kicks de VIF1 y ~39 de GIF DMA (PATH3) por fotograma;
+  440-530 llamadas al VU1 por fotograma; el VU1 es el 96 % del coste de `processVIF1` y ~61 % de la pared total
+  (64-75 % del hilo del EE en juego).
+- Puntos de sincronizacion: lecturas/escrituras de registros VIF1 desde el EE (barrera barata); `vu0_vpu_stat` escrito
+  desde los callbacks al contexto del EE (habria que publicarlo atomico); copia de los datos fuente del VIF1 en el kick
+  (RDRAM se reescribe); orden de GIF entre PATH1/2 (hilo VU1) y PATH3 (EE), que se conservaria con tickets por kick en
+  orden de programa y el mismo tamano de lote en `GifArbiter::drain`; accesos del EE al GS por otras vias.
+- Oraculos: el replay VU1 sigue valido; el modo determinista requeriria una barrera por VBlank.
+- Techo estimado: fotograma ~28-32 ms (VU1 secuencial) = ~31-36 V/s frente a 23; para 50 V/s haria falta ademas ~1,5x
+  en el VU1. Riesgo alto (orden de GIF, carreras); se retoma solo si el GS no resulta ser el cuello.
+
+## Estado verificado por QA (2026-11-11)
+Detalle y evidencia en `docs/` (`QA_REPORT.md`, `AIRBLADE_STATUS.md`, `AIRBLADE_ISSUES.md`, `PERFORMANCE_BASELINE.md`,
+`GRAPHICS_VALIDATION.md`, `LEVEL_COMPLETION_MATRIX.md`, `AUDIO_IMPLEMENTATION_STATUS.md`).
+- Verificado: la serie de `patches/` aplica limpia sobre e563698 y coincide con `third_party/PS2Recomp`
+  (`scripts/check_patches.sh`); replay VU1 20000/20000 y 6000/6000 identicas con el codigo compilado y sin el, y la
+  prueba negativa detecta las llamadas 2964 y 2965; los dos tests del SPU2 pasan por CMake (`-DPS2X_IOP_BUILD_TESTS=ON`);
+  ejecucion reproducible bit a bit en modo determinista; audio de 106 s sin saturacion ni saltos.
+- Rendimiento (carga 11-16, PNG cada VSync): menu 50 V/s, partida 22 V/s con el VU1 compilado (objetivo 50).
+- NO verificado: ninguna comparacion contra PCSX2 (imagen y audio: UNVERIFIED), el volumen del core 1 del SPU2, y el nivel
+  completo (solo se ha jugado la entrada del nivel 1).
 
 ## Estado (2026-11-10)
 - Traduccion: el analizador detecta 3 334 funciones en el ejecutable (un solo segmento, 0x100000-0x336280). 18 dan error
@@ -238,16 +397,28 @@ Herramientas propias (sin parche: `runner/blade_devtools.cpp`, solo se activan c
   `rgba=255,255,255,128` con `ALPHA=0x48` (Cs*As + Cd, aditivo): el blanco saturado es lo que pide el juego. En la
   escena de entrada del nivel 1 un edificio sale como silueta negra (geometria del VU1). El mundo negro de la partida era
   la matriz de camara nula (Pendiente 1, resuelto en la FPU/VU0), no el GS.
-- Pendiente 4 (jugador invisible): en la partida no se dibuja el personaje (ni la tabla), aunque el mundo, el HUD y las
-  estelas del boost si salen. Sin investigar. Hipotesis: la camara de juego queda dentro o muy cerca del jugador (en un
-  volcado de RAM, posicion y objetivo del controlador de camara, estructura en 0x1EC9E68 con objetivo en +0x58, estaban
-  a ~1.17 unidades) o el pipeline con piel (RpSkin, matrices de huesos por VU1) da geometria fuera de pantalla; otra
-  instruccion de FPU/VU0 mal traducida es sospechosa, igual que en Pendiente 1.
-- Pendiente 3: rendimiento. En el nivel van unos 6 VSync por segundo real (14 en el menu). Perfil de 10 s con `sample`
+- Pendiente 4 (jugador invisible; el personaje ya se dibuja, sin tabla ni sombra visibles, sin comparar con PCSX2 - AB-004 en `docs/AIRBLADE_ISSUES.md`): en la partida no se veian el personaje ni la tabla. La camara estaba bien
+  (controlador en 0x1EC9E68: camara en +0xE4, objetivo en +0x34/+0xA0, a 3,2 unidades por detras y a la altura de la
+  cabeza; el jugador, raiz del esqueleto en 0xC04770, en y = 6, y los planos del frustum lo dejan dentro), los huesos
+  tenian matrices ortonormales y el atomico (0xC07DE0, pipeline 0x1ECCF00) se dibujaba: una traza del GS mostraba
+  ~1 300 triangulos en el centro de abajo con RGBA = (95,0,74,0) y la tabla con (112,0,128,0). G y A a cero y
+  `ALPHA=0x44` (Cs*As + Cd*(1-As)): transparentes del todo. El color del material lo arma el EE (0x2107D0, 0x21CF90,
+  0x21D0F0) con `mfc1` + `PEXEW` + `ppacw` (lleva cada componente a la palabra 2 y empaqueta las palabras 0 y 2); con
+  `PEXEW` mal (cambiaba las palabras por pares) las componentes G y A salian de la palabra 3, vacia. Arreglo en
+  `ps2recomp-mmi-permute.patch`.
+- Pendiente 3: rendimiento (2026-11-11, `BLADE_STATS=1`, Mac M1 de 8 nucleos; medidas con otros procesos pesados
+  compitiendo, orientativas). Menu a 50 VSync/s fijos (a ritmo real, PAL); partida del nivel 1 entre 14 y 22 VSync/s
+  (antes 16 VSync/s a 60 Hz). Ya no hay espera activa: en la partida el hilo del EE esta ~100 % ocupado, ~75 % en el
+  VU1 (interprete, en sincrono dentro del DMA del VIF1 lanzado por 0x1DD730), ~13 % copiando subidas de imagen al hilo
+  del GS (`UploadImage`) y ~10 % encolando primitivas (`GSThreadedBackend::Submit`, ~400 bytes por primitiva); el hilo
+  del rasterizador esta ~90 % ocupado. Para 50 VSync/s hacen falta ~2,5x en los dos: un recompilador de los
+  microprogramas del VU1 (son fijos, de RenderWare) y abaratar el paso de primitivas al hilo del GS. Ojo: no se acelera
+  la simulacion, el VBlank sigue a ritmo real.
+- Pendiente 3 (anterior): en el nivel iban unos 6 VSync por segundo real (14 en el menu). Perfil de 10 s con `sample`
   durante la entrada: el rasterizador por CPU (`SampleTexture` + `WritePixel` + `Submit` + `ReadTexture`, unas 4 900
   muestras) y el interprete de VU1 (`commitReadyPipelines`, `calculatePairReadyCycle`, `execUpper`..., unas 2 800) se
-  llevan casi todo; el codigo recompilado del EE apenas aparece. El SPU2 del IOP no mezcla audio, asi que no se oye la
-  musica ni los efectos de LIBSD/TSSDRV.
+  llevan casi todo; el codigo recompilado del EE apenas aparece. (Obsoleto: el SPU2 ya mezcla audio, ver
+  `ps2recomp-z-spu2-mixer.patch`.)
 - Metodo tomado de [hctp-recomp](https://github.com/BigDaddyJRich/hctp-recomp) (WWE SmackDown! HCTP con PS2Recomp:
   Ghidra + emotionengine-reloaded + inicios recuperados), que tambien ejecuta los IRX propios del juego.
 - Otras funciones de libcdvd sin nombre en el mismo bloque (0x113070, 0x1132A8, 0x113340, 0x113470, 0x1137D8, 0x113AF0): si

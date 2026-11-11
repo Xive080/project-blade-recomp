@@ -137,6 +137,10 @@ Propios:
   `PS2X_DETERMINISTIC=1`; sin la variable no cambia nada. Sin ritmo de reloj de pared (los plazos se cumplen por ciclos
   del EE) y con un gancho `ps2xQaVSyncHook` que se llama en el hilo del EE al empezar cada VBlank. Se aplica despues de
   `ee-idle-iop` y `pal-vblank` y antes de `z-spu2-mixer`. Lo usa `runner/qa_deterministic.cpp`.
+- `ps2recomp-z-gs-fastpath.patch` (rasterizador por CPU; se aplica despues de los demas parches del GS): rutas rapidas de
+  muestreo de textura y de `WritePixel` por primitiva y reparto por bandas; ver "GS: rutas rapidas". Variables:
+  `PS2X_GS_AB=1` (compara cada tramo con la ruta antigua en serie y aborta si la VRAM difiere), `PS2X_GS_LEGACY=1` (fuerza
+  la ruta antigua) y `PS2X_GS_PROFILE=1` (tiempos de CPU del GS).
 - `ps2recomp-z-spu2-mixer.patch`: mezclador SPU2 real en el emulador del IOP (aplicar el ultimo; toca la misma zona del
   bucle del IOP que `vu1-fast`). Decodificador ADPCM (16 bytes/28 muestras), 48 voces con tono, ADSR, volumen, bucle y
   ENDX, mezcla a 48 kHz con volumenes maestros y reverb (anillo de la RAM del SPU2), todo sincronizado con el reloj del
@@ -223,6 +227,39 @@ Herramientas propias (sin parche: `runner/blade_devtools.cpp`, solo se activan c
 - Guion que llega hasta el modo historia: `BLADE_INPUT="300:START;400:START;500:START;600:START;700:START;900:CROSS;1050:CROSS;1200:CROSS;2250:CROSS;2400:CROSS"`.
   Con la tarjeta `mc0` que ya tiene la partida (`BESCES-50246000`) y 50 Hz, la partida del nivel 1 empieza hacia el
   VSync 3500.
+
+## GS: rutas rapidas (2026-11-11)
+
+Rasterizador por CPU (`GSCpuBackend`). Perfil de partida (8 hilos, GS con 4 bandas): el hilo principal del GS estaba ~66-85 %
+ocupado y los tres trabajadores ~25-38 %; el principal hacia el trabajo en serie que no se repartia. Cambios (parche
+`ps2recomp-z-gs-fastpath.patch`), todos con la misma aritmetica que antes:
+
+1. Muestreo de textura por primitiva (`GSTexPipe` + `sampleT<PSM>`): clamp, wrap, formato y TEXA decodificados una vez por
+   primitiva; lecturas de texel en linea con las tablas de paginas (ahora visibles desde `ps2_gs_memory.h`); paleta CLUT con
+   TEXA ya aplicado por hilo, que se rehace al cambiar `m_clutGeneration` (carga de CLUT/reinicio), el formato o TEXA. No hay
+   cache de texturas decodificadas, asi que no hay nada que invalidar al escribir la VRAM. Los PSM sin plantilla vuelven a
+   `SampleTexture`.
+2. `WritePixel` por primitiva (`GSPixelPipe` + `WritePixelFast`/`EarlyDepthFast`): estado de pixel decodificado una vez,
+   alpha test solo si ATE, y lectura/escritura de CT32/CT24/Z32/Z24 en linea. Los demas formatos usan los punteros de antes.
+3. Reparto por bandas: los intervalos de paginas de FRAME/ZBUF se calculan hasta la ultima fila que toca el tramo y no hasta
+   el scissor, y el intervalo de paginas de la textura es el exacto (+1 de desbordamiento). Antes casi todo se solapaba y se
+   dibujaba en serie en el hilo principal.
+
+Medicion (determinista, hasta el VSync 3950, mismo guion; `PS2X_GS_PROFILE=1`, maquina con carga ~4-5):
+- Tiempo total de la ejecucion determinista: 157 s y 156 s (antes) frente a 116 s y 116 s (despues), x1,35.
+- Tiempo de pared del hilo principal del GS en `SubmitMany`: 152,6 s (solo 1 y 2, tramos en serie 74 s) a 102 s (con 3, serie 27 s).
+  Lo que queda en serie son 84 000 primitivas cuya textura lee el propio destino (18 s) y 79 000 con FRAME/ZBUF solapados (8 s).
+- En partida a tiempo real (VSync > 2700, maquina libre) no cambia: 32,5 y 32,6 V/s antes, 31,8 y 31,9 V/s despues (fotograma
+  medio 30,8 ms frente a 31,5 ms). Ahi el limite es el hilo del EE (VU1), no el GS; las mejoras del GS se notan donde el GS
+  era el cuello (menus, cinematicas, carga).
+
+Verificacion: (a) `PS2X_GS_AB=1`: 274 000 tramos de una ejecucion completa comparados (ruta nueva paralela contra ruta antigua
+en serie sobre la misma VRAM), 0 diferencias; (b) modo determinista: hashes de RAM y de fotograma cada 50 ticks hasta el 3950
+identicos entre la base y la version nueva (4 ejecuciones), y los 15 PNG volcados cada 250 ticks identicos byte a byte.
+
+Certificacion independiente del QA: el parche aplica sobre la serie de 19 en un arbol limpio; en modo determinista (con la ruta
+rapida y con `PS2X_GS_LEGACY=1`) los 78 hashes de RAM/fotograma y los 79 PNG hasta el VSync 3950 son identicos a los de antes del
+parche. Las cifras de rendimiento de esta seccion son de dev 2; el QA no pudo repetirlas (maquina cargada): UNVERIFIED.
 
 ## VU1 compilado: pasos 1 y 2 (2026-11-11)
 

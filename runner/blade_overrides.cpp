@@ -5,6 +5,7 @@
 #include "ps2_runtime_macros.h"
 #include "ps2_stubs.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -86,12 +87,101 @@ namespace
         gRwTexCacheInit(rdram, ctx, runtime);
     }
 
+    // 0x1DF500 = espera del driver sky2 de RenderWare a que la cola de imagenes pendientes de mostrar baje del limite:
+    //   while (*(gp-0x7EE8) + 1 < *(gp-0x79C8)) {
+    //       if (gp-0x7930 || gp-0x79D0 || gp-0x79CC) { DI; if (gp-0x79CC) gp-0x79CC |= 4; EI; }  // ocupado
+    //       else 0x1DEE30();                                                                     // lanza el siguiente
+    //   }
+    // Mientras esta "ocupado" el bucle solo espera a que una interrupcion (el VBlank que da la vuelta a la imagen)
+    // cambie esas variables. En el runtime las interrupciones solo entran cuando el hilo vuelve al planificador, asi que
+    // el bucle original quemaba ciclos del EE de 8 en 8 (y hacia correr el IOP un ciclo cada vez) hasta llegar al
+    // plazo del VBlank: ~30 % del hilo del EE en la partida. Aqui, mientras esta ocupado, el tiempo avanza en pasos de
+    // kIdleStepCycles ciclos (mismo reloj del EE e IOP que antes) hasta que toca atender algo y se vuelve al planificador.
+    // Mismo marco de pila que el original (para volver a entrar tras ceder o tras una expropiacion dentro de 0x1DEE30).
+    constexpr uint32_t kSkyWaitEntry = 0x001DF500u;
+    constexpr uint32_t kSkyWaitLoop = 0x001DF514u;    // reentrada: marco ya creado
+    constexpr uint32_t kSkyWaitAfterKick = 0x001DF540u; // vuelta de 0x1DEE30
+    constexpr uint32_t kSkyKick = 0x001DEE30u;
+    constexpr uint32_t kIdleStepCycles = 1024u;
+
+    uint32_t readGuest32(const uint8_t *rdram, uint32_t address)
+    {
+        uint32_t value = 0;
+        std::memcpy(&value, rdram + (address & (PS2_RAM_SIZE - 1u)), sizeof(value));
+        return value;
+    }
+
+    void writeGuest32(uint8_t *rdram, uint32_t address, uint32_t value)
+    {
+        std::memcpy(rdram + (address & (PS2_RAM_SIZE - 1u)), &value, sizeof(value));
+    }
+
+    void ovSkyWaitQueue(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t sp0 = GPR_U32(ctx, 29);
+        if (ctx->pc == kSkyWaitEntry)
+        {
+            // addiu sp,-0x20; sq ra,0x10(sp); sq s0,0(sp); addiu s0,gp,-0x7EE8
+            const uint32_t sp = sp0 - 0x20u;
+            SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp));
+            WRITE128(sp + 0x10u, GPR_VEC(ctx, 31));
+            WRITE128(sp, GPR_VEC(ctx, 16));
+        }
+        const uint32_t gp = GPR_U32(ctx, 28);
+        SET_GPR_S32(ctx, 16, static_cast<int32_t>(gp - 0x7EE8u));
+        for (;;)
+        {
+            const int32_t done = static_cast<int32_t>(readGuest32(rdram, gp - 0x7EE8u)) + 1;
+            const int32_t queued = static_cast<int32_t>(readGuest32(rdram, gp - 0x79C8u));
+            if (done >= queued)
+            {
+                // registros como los deja el original: v1, a0, at; lq ra/s0; addiu sp,0x20; jr ra
+                SET_GPR_S32(ctx, 3, done);
+                SET_GPR_S32(ctx, 4, queued);
+                SET_GPR_S32(ctx, 1, 0);
+                const uint32_t sp = GPR_U32(ctx, 29);
+                SET_GPR_VEC(ctx, 31, READ128(sp + 0x10u));
+                SET_GPR_VEC(ctx, 16, READ128(sp));
+                SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp + 0x20u));
+                ctx->pc = GPR_U32(ctx, 31);
+                return;
+            }
+            const uint32_t busy79CC = readGuest32(rdram, gp - 0x79CCu);
+            if (readGuest32(rdram, gp - 0x7930u) || readGuest32(rdram, gp - 0x79D0u) || busy79CC)
+            {
+                if (busy79CC)
+                    writeGuest32(rdram, gp - 0x79CCu, busy79CC | 4u);
+                SET_GPR_S32(ctx, 2, static_cast<int32_t>(readGuest32(rdram, gp - 0x79CCu)));
+                // nada cambia hasta que el hilo ceda: avanzar el reloj hasta el siguiente punto que atender, en pasos
+                // cortos (con pasos de 4096 ciclos o mas el menu perdia imagenes del video de fondo; probablemente el IOP
+                // adelantaba varias respuestas sin que el EE las atendiera entre medias) y sin pasar de largo una interrupcion de los temporizadores
+                for (;;)
+                {
+                    const uint64_t timer = runtime->memory().cyclesUntilNextEeTimerInterrupt();
+                    const uint32_t cycles =
+                        static_cast<uint32_t>(std::max<uint64_t>(1u, std::min<uint64_t>(kIdleStepCycles, timer)));
+                    if (runtime->eeCheckpointDue(cycles))
+                        break;
+                }
+                ctx->pc = kSkyWaitLoop;
+                return;
+            }
+            SET_GPR_U32(ctx, 31, kSkyWaitAfterKick);
+            if (!runtime->dispatchGuestBranch(rdram, ctx, kSkyKick, 0x1DF538u, kSkyWaitAfterKick,
+                                              PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                return;
+        }
+    }
+
     void applyBlade(PS2Runtime &runtime)
     {
         gRwTexCacheInit = runtime.lookupFunction(0x001F39E0u);
         if (gRwTexCacheInit)
             runtime.replaceFunction(0x001F39E0u, ovRwTexCacheInit);
         runtime.replaceFunction(0x00113F40u, ovCdDiskReady);
+        if (std::getenv("BLADE_NO_SKYWAIT") == nullptr)
+            for (const uint32_t pc : {kSkyWaitEntry, kSkyWaitLoop, kSkyWaitAfterKick, 0x001DF550u, 0x001DF570u})
+                runtime.replaceFunction(pc, ovSkyWaitQueue);
         useDiscImage();
         bladeStartDevTools(runtime);
         bladeStartKeyboardMouse(runtime);

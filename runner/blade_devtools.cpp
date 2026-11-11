@@ -7,6 +7,10 @@
 //                                        Mientras el guion tiene pasos pendientes el teclado no cuenta; al acabar se suelta.
 //   BLADE_DUMP_RAM=carpeta,VSync[,VSync...] guarda la RAM del EE (32 MB) en carpeta/ram_VSync.bin al llegar a cada VSync.
 //   BLADE_EXIT_TICK=N                    cierra el proceso al llegar al VSync N (para pruebas sin ventana atendida).
+//   BLADE_STATS=1                        escribe cada segundo real el VSync actual y los VSync por segundo
+//                                        ("[blade:stats] VSync N  V/s") y, justo antes, "[blade:frames]" con la media, el minimo y el p1% de
+//                                        los tiempos de fotograma de ese segundo; al salir, el total.
+//   BLADE_VU1_REPLAY=fichero             reproduce y compara una grabacion del VU1 (PS2X_VU1_RECORD=fichero[,desde[,cuantas]]) y sale.
 //   BLADE_HIDDEN=1                       crea la ventana oculta y sin foco (pruebas en segundo plano; los volcados
 //                                        de marcos siguen funcionando porque leen la imagen del GS, no la ventana).
 // Leen el marco ya presentado (GS::copyLatchedHostPresentationFrame, protegido por su mutex) y usan el estado forzado
@@ -155,9 +159,37 @@ namespace
     }
 
     void devLoop(PS2Runtime *rt, std::filesystem::path dumpDir, uint64_t dumpEvery, uint64_t dumpFrom, std::vector<InputStep> steps,
-                 uint64_t exitTick, std::filesystem::path ramDir, std::vector<uint64_t> ramTicks)
+                 uint64_t exitTick, std::filesystem::path ramDir, std::vector<uint64_t> ramTicks, bool stats)
     {
         uint64_t last = ~0ull;
+        auto statsSince = std::chrono::steady_clock::now();
+        uint64_t statsTick = 0;
+        // Tiempos de fotograma (ms reales entre VSync; si el tiempo avanza a saltos, el salto se reparte).
+        std::vector<float> frameMs, allFrameMs;
+        auto frameSince = statsSince;
+        uint64_t frameTick = 0;
+        const auto percentile = [](std::vector<float> &v, double q)
+        {
+            if (v.empty())
+                return 0.0f;
+            const size_t i = std::min(v.size() - 1, static_cast<size_t>(q * static_cast<double>(v.size())));
+            std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(i), v.end());
+            return v[i];
+        };
+        const auto summary = [&](const char *tag, std::vector<float> &v)
+        {
+            if (v.empty())
+                return;
+            double sum = 0.0;
+            for (const float f : v)
+                sum += f;
+            const float mn = *std::min_element(v.begin(), v.end());
+            const float p99 = percentile(v, 0.99);
+            std::printf("[blade:frames] %s n=%zu media %.1f ms (%.1f/s) min %.1f ms p1%% %.1f ms (%.1f/s)\n", tag, v.size(),
+                        sum / static_cast<double>(v.size()), 1000.0 / (sum / static_cast<double>(v.size())), mn, p99,
+                        1000.0 / std::max(p99, 0.001f));
+            std::fflush(stdout);
+        };
         bool overrideOn = false;
         const uint64_t lastStepEnd = steps.empty() ? 0u
                                                    : std::max_element(steps.begin(), steps.end(),
@@ -168,6 +200,30 @@ namespace
             std::this_thread::sleep_for(std::chrono::microseconds(250));
             const uint64_t tick = rt->eeScheduler().currentVSyncTick();
             const auto now = std::chrono::steady_clock::now();
+            if (stats && tick != frameTick)
+            {
+                if (tick > frameTick && frameTick != 0u)
+                {
+                    const float per = std::chrono::duration<float, std::milli>(now - frameSince).count() /
+                                      static_cast<float>(tick - frameTick);
+                    for (uint64_t i = frameTick; i < tick && frameMs.size() < 4096u; ++i)
+                        frameMs.push_back(per);
+                    allFrameMs.push_back(per);
+                }
+                frameTick = tick;
+                frameSince = now;
+            }
+            if (stats && now - statsSince >= std::chrono::seconds(1))
+            {
+                summary("1s", frameMs);
+                frameMs.clear();
+                const double secs = std::chrono::duration<double>(now - statsSince).count();
+                std::printf("[blade:stats] VSync %llu %.1f\n", static_cast<unsigned long long>(tick),
+                            static_cast<double>(tick - statsTick) / secs);
+                std::fflush(stdout);
+                statsSince = now;
+                statsTick = tick;
+            }
             bool holding = false;
             for (InputStep &s : steps)
             {
@@ -225,6 +281,8 @@ namespace
             }
             if (exitTick && tick >= exitTick)
             {
+                if (stats)
+                    summary("total", allFrameMs);
                 std::cout << "[blade] BLADE_EXIT_TICK alcanzado (" << tick << ")" << std::endl;
                 std::fflush(stdout);
                 std::_Exit(0);
@@ -233,8 +291,16 @@ namespace
     }
 }
 
+int ps2xVu1Replay(const char *path); // third_party/PS2Recomp, ps2_vu1_core.cpp
+int ps2xVu1Gen(const char *spec);
+
 void bladeStartDevTools(PS2Runtime &runtime)
 {
+    // BLADE_VU1_REPLAY=fichero: reproduce un fichero grabado con PS2X_VU1_RECORD, compara y sale (0 = identico).
+    if (const char *replay = std::getenv("BLADE_VU1_REPLAY"); replay && *replay)
+        std::exit(ps2xVu1Replay(replay));
+    if (const char *gen = std::getenv("BLADE_VU1_GEN"); gen && *gen)
+        std::exit(ps2xVu1Gen(gen));
     std::filesystem::path dumpDir;
     uint64_t dumpEvery = 30;
     uint64_t dumpFrom = 0;
@@ -281,7 +347,10 @@ void bladeStartDevTools(PS2Runtime &runtime)
             std::filesystem::create_directories(ramDir, ec);
         }
     }
-    if (dumpDir.empty() && steps.empty() && !exitTick && ramTicks.empty())
+    const char *statsEnv = std::getenv("BLADE_STATS");
+    const bool stats = statsEnv && *statsEnv && *statsEnv != '0';
+    if (dumpDir.empty() && steps.empty() && !exitTick && ramTicks.empty() && !stats)
         return;
-    std::thread(devLoop, &runtime, dumpDir, dumpEvery, dumpFrom, std::move(steps), exitTick, ramDir, std::move(ramTicks)).detach();
+    std::thread(devLoop, &runtime, dumpDir, dumpEvery, dumpFrom, std::move(steps), exitTick, ramDir, std::move(ramTicks),
+                stats).detach();
 }

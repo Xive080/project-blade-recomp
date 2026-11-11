@@ -1,0 +1,91 @@
+diff --git a/ps2xRecomp/src/lib/mmi_translation_helpers.cpp b/ps2xRecomp/src/lib/mmi_translation_helpers.cpp
+index 9a284a4..b02fc02 100644
+--- a/ps2xRecomp/src/lib/mmi_translation_helpers.cpp
++++ b/ps2xRecomp/src/lib/mmi_translation_helpers.cpp
+@@ -105,9 +105,9 @@ namespace ps2recomp
+         case MMI1_PEXTUW:
+             return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PEXTUW(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})));", rd, rs, rt);
+         case MMI1_PADDUH:
+-            return fmt::format("SET_GPR_VEC(ctx, {}, _mm_add_epi16(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})));", rd, rs, rt);
++            return fmt::format("SET_GPR_VEC(ctx, {}, _mm_adds_epu16(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})));", rd, rs, rt);
+         case MMI1_PSUBUH:
+-            return fmt::format("SET_GPR_VEC(ctx, {}, _mm_sub_epi16(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})));", rd, rs, rt);
++            return fmt::format("SET_GPR_VEC(ctx, {}, _mm_subs_epu16(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})));", rd, rs, rt);
+         case MMI1_PEXTUH:
+             return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PEXTUH(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})));", rd, rs, rt);
+         case MMI1_PADDUB:
+diff --git a/ps2xRuntime/include/ps2_runtime_macros.h b/ps2xRuntime/include/ps2_runtime_macros.h
+index afd0a68..3a7f641 100644
+--- a/ps2xRuntime/include/ps2_runtime_macros.h
++++ b/ps2xRuntime/include/ps2_runtime_macros.h
+@@ -805,53 +805,27 @@ inline __m128i ps2_ppacb(__m128i rs, __m128i rt)
+ // Packed Multiply-Add (PMADD)
+ #define PS2_PMADDW(a, b) _mm_add_epi32(_mm_mullo_epi32(_mm_shuffle_epi32((__m128i)(a), _MM_SHUFFLE(1, 0, 3, 2)), _mm_shuffle_epi32((__m128i)(b), _MM_SHUFFLE(1, 0, 3, 2))), _mm_mullo_epi32(_mm_shuffle_epi32((__m128i)(a), _MM_SHUFFLE(3, 2, 1, 0)), _mm_shuffle_epi32((__m128i)(b), _MM_SHUFFLE(3, 2, 1, 0))))
+ 
+-// Packed Variable Shifts
+-#define PS2_PSLLVW(a, b) _mm_custom_sllv_epi32((__m128i)(a), (__m128i)(b))
+-#define PS2_PSRLVW(a, b) _mm_custom_srlv_epi32((__m128i)(a), (__m128i)(b))
+-#define PS2_PSRAVW(a, b) _mm_custom_srav_epi32((__m128i)(a), (__m128i)(b))
+-
+-inline __m128i _mm_custom_sllv_epi32(__m128i a, __m128i count)
+-{
+-    alignas(16) int32_t a_arr[4];
+-    alignas(16) int32_t count_arr[4];
+-    alignas(16) int32_t result[4];
+-
+-    std::memcpy(a_arr, &a, sizeof(a));
+-    std::memcpy(count_arr, &count, sizeof(count));
+-
+-    for (int i = 0; i < 4; i++)
+-    {
+-        result[i] = a_arr[i] << (count_arr[i] & 0x1F);
+-    }
+-
+-    __m128i out;
+-    std::memcpy(&out, result, sizeof(out));
+-    return out;
+-}
+-
+-inline __m128i _mm_custom_srlv_epi32(__m128i a, __m128i count)
+-{
+-    int32_t a_arr[4], count_arr[4], result[4];
+-    _mm_storeu_si128((__m128i *)a_arr, a);
+-    _mm_storeu_si128((__m128i *)count_arr, count);
+-    for (int i = 0; i < 4; i++)
+-    {
+-        result[i] = (uint32_t)a_arr[i] >> (count_arr[i] & 0x1F);
+-    }
+-    return _mm_loadu_si128((__m128i *)result);
+-}
+-
+-inline __m128i _mm_custom_srav_epi32(__m128i a, __m128i count)
++// Packed Variable Shifts (R5900): PSLLVW/PSRLVW/PSRAVW rd, rt, rs. Solo trabajan sobre las palabras 0 y 2: el valor sale de rt,
++// la cantidad de rs[4:0], y cada resultado de 32 bits se extiende con signo a 64 bits (palabras 1 y 3 = signo).
++// Las macros reciben (rs, rt) en el orden en que las emite el traductor.
++inline __m128i ps2_pshiftvw(__m128i rs, __m128i rt, int kind)
+ {
+-    int32_t a_arr[4], count_arr[4], result[4];
+-    _mm_storeu_si128((__m128i *)a_arr, a);
+-    _mm_storeu_si128((__m128i *)count_arr, count);
+-    for (int i = 0; i < 4; i++)
++    int32_t s[4], t[4];
++    _mm_storeu_si128((__m128i *)s, rs);
++    _mm_storeu_si128((__m128i *)t, rt);
++    int64_t r[2];
++    for (int i = 0; i < 2; ++i)
+     {
+-        result[i] = a_arr[i] >> (count_arr[i] & 0x1F);
++        const int sh = s[i * 2] & 0x1F;
++        const int32_t v = t[i * 2];
++        int32_t o = kind == 0 ? (int32_t)((uint32_t)v << sh) : kind == 1 ? (int32_t)((uint32_t)v >> sh) : (v >> sh);
++        r[i] = (int64_t)o;
+     }
+-    return _mm_loadu_si128((__m128i *)result);
++    return _mm_loadu_si128((const __m128i *)r);
+ }
++#define PS2_PSLLVW(a, b) ps2_pshiftvw((__m128i)(a), (__m128i)(b), 0)
++#define PS2_PSRLVW(a, b) ps2_pshiftvw((__m128i)(a), (__m128i)(b), 1)
++#define PS2_PSRAVW(a, b) ps2_pshiftvw((__m128i)(a), (__m128i)(b), 2)
+ 
+ // PMFHL function implementations
+ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)

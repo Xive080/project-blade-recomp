@@ -102,6 +102,10 @@ Propios:
   medios en vez de cada mitad de 64 bits), `PINTH` y `PINTEH`. Ahora todas son macros `PS2_*` de `ps2_runtime_macros.h`
   con la definicion del manual del EE (como PCSX2), comprobadas con un test. En AirBlade solo se usa `PEXEW` (10 veces),
   que ya iba por macro: el codigo generado no cambia, basta recompilar.
+- `ps2recomp-mmi-shifts-saturate.patch`: `PADDUH`/`PSUBUH` no saturaban (son con saturacion sin signo) y
+  `PSLLVW`/`PSRLVW`/`PSRAVW` tenian al reves valor (rt) y cantidad (rs[4:0]), y calculaban las 4 palabras en vez de las
+  palabras 0 y 2 con extension de signo a 64 bits. Comprobadas con vectores del manual. AirBlade no usa ninguna de estas
+  instrucciones: el codigo generado no cambia.
 - `ps2recomp-dispatch-unwind.patch`: `dispatchGuestBranch` tomaba "el llamado vuelve con pc == su entrada" por "volvio
   sin tocar pc" y seguia en la vuelta. Con una llamada recursiva (A -> ... -> jalr A) interrumpida justo en la entrada
   interna por un punto seguro del planificador, el pc es la entrada de A y el llamador externo seguia con el sp y el ra
@@ -442,7 +446,10 @@ Detalle y evidencia en `docs/` (`QA_REPORT.md`, `AIRBLADE_STATUS.md`, `AIRBLADE_
   `ALPHA=0x44` (Cs*As + Cd*(1-As)): transparentes del todo. El color del material lo arma el EE (0x2107D0, 0x21CF90,
   0x21D0F0) con `mfc1` + `PEXEW` + `ppacw` (lleva cada componente a la palabra 2 y empaqueta las palabras 0 y 2); con
   `PEXEW` mal (cambiaba las palabras por pares) las componentes G y A salian de la palabra 3, vacia. Arreglo en
-  `ps2recomp-mmi-permute.patch`.
+  `ps2recomp-mmi-permute.patch`. Con el guion del README y el modo determinista del QA el personaje se ve de pie. Si se
+  anaden pulsaciones extra de X (2700, 2900, 3100) el juego llega a otro estado y el personaje pasa por detras de la camara:
+  no es un fallo de dibujo. El resultado es identico con y sin `PS2X_VU1_NOGEN=1` (el VU1 compilado no es la causa). Sigue
+  abierto (AB-004, confirmado contra PCSX2): la tabla llega al GS con A = 0 (112,112,128,0) y la sombra no se ve.
 - Pendiente 3: rendimiento (2026-11-11, `BLADE_STATS=1`, Mac M1 de 8 nucleos; medidas con otros procesos pesados
   compitiendo, orientativas). Menu a 50 VSync/s fijos (a ritmo real, PAL); partida del nivel 1 entre 14 y 22 VSync/s
   (antes 16 VSync/s a 60 Hz). Ya no hay espera activa: en la partida el hilo del EE esta ~100 % ocupado, ~75 % en el

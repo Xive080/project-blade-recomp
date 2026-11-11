@@ -1,0 +1,68 @@
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 45cb9d2..32a238b 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1342,6 +1342,14 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
+     }
+ }
+ 
++namespace
++{
++    // Set when a dispatch gives control back to the EE scheduler (safe point, jump to another function, missing
++    // target) instead of finishing the call: the generated callers then return one by one and the scheduler resumes
++    // the guest at ctx->pc. Only the EE executor thread dispatches guest code.
++    thread_local bool g_guestUnwinding = false;
++}
++
+ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+                                      R5900Context *ctx,
+                                      uint32_t targetPc,
+@@ -1358,6 +1366,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+     // this charge bounds straight-line call chains that have no local loop.
+     if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
+     {
++        g_guestUnwinding = true;
+         return false;
+     }
+ 
+@@ -1369,6 +1378,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+         }
+ 
+         ctx->pc = targetPc;
++        g_guestUnwinding = true;
+         return false;
+     }
+ 
+@@ -1388,14 +1398,17 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+         {
+             ctx->pc = targetPc;
+             // if you need the app to keep open to open debug pannel change this to false
++            g_guestUnwinding = true;
+             return false;
+         }
+ 
++        g_guestUnwinding = true;
+         return false;
+     }
+ 
+     RecompiledFunction targetFn = lookupFunction(targetPc);
+     const uint32_t entryPc = ctx->pc;
++    g_guestUnwinding = false;
+     targetFn(rdram, ctx, this);
+ 
+     if (isStopRequested() || ctx->pc == 0u)
+@@ -1403,6 +1416,14 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+         return false;
+     }
+ 
++    // The callee stopped at a nested dispatch: keep unwinding. Without this, a recursive call preempted at its own
++    // entry (A -> ... -> jalr A, safe point due) comes back with ctx->pc == entryPc and was taken for "the callee
++    // returned without setting pc": the caller went on at the fallthrough with the inner frame's sp and ra.
++    if (g_guestUnwinding)
++    {
++        return false;
++    }
++
+     if (ctx->pc == entryPc)
+     {
+         ctx->pc = fallthroughPc;

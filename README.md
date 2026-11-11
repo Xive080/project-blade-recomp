@@ -77,11 +77,33 @@ Propios:
   destino no solapa la textura (`PS2X_GS_RASTER_THREADS=N`); prueba Z antes de leer la textura; los triangulos solo
   recorren el tramo que cubren sus aristas; el VU1 recorre solo las entradas validas de sus colas. Con un flujo del GS
   grabado en el nivel 1: 8,8 s -> 4,9 s, con las 38 imagenes y la VRAM final identicas bit a bit.
+- `ps2recomp-vu1-fast.patch`: mas rendimiento del VU1 y del IOP sin cambiar la imagen. El VU1 escribe los inmediatos
+  sin pasar por la ruta general, guarda la decodificacion de cada microinstruccion, salta los eventos que no cambian
+  nada y calcula las banderas MAC por la via rapida; el IOP recorre solo los hilos vivos. Comprobado con un flujo del
+  VU1 grabado y reproducido: salida identica. Menu de ~25 a ~37 VSync/s y nivel 1 de ~18 a 30-37 VSync/s.
 - `ps2recomp-ee-idle-iop.patch`: con todos los hilos del EE parados, `EeScheduler::waitForEvent` esperaba al siguiente
   plazo (el VSync, en tiempo real) y solo entonces daba esos ciclos al IOP de golpe: cada peticion al IOP desde un hilo
   que se queda esperando (lectura de CD por GTFSCDVD, RPC) costaba un VSync entero. Ahora adelanta el tiempo en pasos de
   32 768 ciclos del EE, haciendo correr al IOP, y vuelve en cuanto hay algo que atender en el EE (evento, invocacion SIF,
   hilo listo o temporizador). Si nada despierta, espera al plazo como antes (mismo ritmo en tiempo real).
+- `ps2recomp-fpu-vu0-r5900.patch`: aritmetica del R5900 en el traductor y el runtime (hay que regenerar el codigo).
+  - `SQRT.S fd, ft`: en el R5900 el operando va en el campo ft (fs no se usa, como en PCSX2); el traductor leia fs, asi
+    que cada raiz cuadrada con ft != fs (63 en el ejecutable: `RwV3dLength`/`RwV3dNormalize` de RenderWare y codigo del
+    juego) calculaba la raiz de otro registro.
+  - `CVT.W.S` trunca siempre (GCC lo usa para `(int)f`) y satura si no cabe; el runtime redondeaba al mas cercano
+    (`nearbyintf`). 287 usos.
+  - Macros de VU0: `VDIV`/`VSQRT`/`VRSQRT` con la aritmetica de la FPU (divisor cero = +-max, raiz de |ft|) en vez de
+    dar 0; `VRSQRT` calcula fs/sqrt(ft) (antes 1/sqrt(ft), ignoraba fs).
+- `ps2recomp-dispatch-unwind.patch`: `dispatchGuestBranch` tomaba "el llamado vuelve con pc == su entrada" por "volvio
+  sin tocar pc" y seguia en la vuelta. Con una llamada recursiva (A -> ... -> jalr A) interrumpida justo en la entrada
+  interna por un punto seguro del planificador, el pc es la entrada de A y el llamador externo seguia con el sp y el ra
+  del marco interno: salto a la pila (0x1FFF990) y el hilo principal moria. Ahora una marca indica que se esta
+  deshaciendo la pila hacia el planificador y los llamadores devuelven `false` hasta llegar a el.
+
+Arreglos del juego (sin parche, en `runner/blade_overrides.cpp`):
+- Cache de texturas de RenderWare (0x1F39E0): en el modo de video 38 (640x512, entrelazado + FSAA) el driver calcula el
+  inicio de la cache pasado el final de los 4 MB y un tamano negativo; el override da la vuelta al inicio (pagina 48) y
+  acaba la cache donde empieza el primer buffer de dibujo (pagina 160). Ver "Pendiente 2" en Estado.
 
 Herramientas propias (sin parche: `runner/blade_devtools.cpp`, solo se activan con variables de entorno):
 - `BLADE_DUMP_FRAMES=carpeta[,cada_N[,desde]]`: guarda en PNG la imagen presentada cada N VSync (`frame_TTTTTT.png`;
@@ -168,31 +190,59 @@ Herramientas propias (sin parche: `runner/blade_devtools.cpp`, solo se activan c
   0x4000 bytes que terminan en `jr $ra` + delay slot (+ relleno) justo antes de la funcion siguiente; recupera 0x232320
   y 0x1E0510 (un `switch` al que apunta 0x2E4DD4). Un barrido de los punteros de los datos a codigo fuera de funciones
   no encuentra mas.
-- Hasta donde llega ahora: la escena de entrada del nivel 1 se dibuja entera (piso con sofa y ciudad, hito 11 al
-  terminar la carga con "X CONTINUE") y la partida empieza: HUD con boost, puntos y tiempo (2:26, baja a 50 VSync por
-  segundo de juego), retrato y barra de dialogo abajo. El mando se lee en la partida: CUADRADO da un truco ("350" en
-  rojo). Sin cuelgues ni hilos muertos hasta el VSync 5300 (hito 12).
-- Pendiente 1 (mundo negro en la partida): desde el VSync ~2650 (fin de la escena) no se ve el mundo ni el personaje,
-  solo el HUD. Traza del GS en la partida: solo abanicos del HUD (tbp 3360/3904/4448) y 86 tiras por imagen sin
-  textura con todos los vertices en (2048,2048) = el centro (ofs 1728,1792 + 320,256), z = 2^24 y q = FLT_MAX
-  (w = 0). Volcado de la memoria de VU1 en un XGKICK de esas tiras: la salida es XYZ `0x8000,0x8000,0x7fffffff` (NaN
-  convertido) y los registros VF tienen NaN; la causa esta antes: la matriz de transformacion del bloque de constantes
-  (qwords 0x3F0-0x3F3, que sube el EE con `UNPACK V4-32 num=13 addr=0x3F0`, codigo VIF `0x6C0D03F0`) llega toda a
-  cero. Los paquetes DMA en RAM (p. ej. 0x33EABC en el VSync 4700) ya traen esas 4 filas a cero (alguna con -0), con el
-  resto de constantes bien (640x512, 2048/2048, 0.75, 635...). Es decir, el EE calcula una matriz camara x proyeccion
-  nula en la partida (en la escena de entrada si sale bien). Siguiente paso: encontrar quien escribe esas 4 filas
-  (buscar el `sq` al buffer DMA del paquete) y seguir hacia atras hasta la matriz de la camara de juego (camara que
-  sigue al jugador); sospechosas: una macro de VU0 / FPU con resultado distinto (p. ej. normalizar un vector cero, o
-  `rsqrt`/`div` con 0) o la posicion del jugador sin iniciar.
-- Pendiente 2 (menu corrupto): cada imagen el menu sube el video de fondo (MENUBASE.M2V, 640x512) como 40 trozos CT32
-  de 128x64 en los bloques 1536..6655 y las fuentes detras (hasta ~8032), pero los buffers de pantalla estan en las
-  paginas 160 y 320 (bloques 5120 y 10240) y el Z en la 480 (Z16S, 80 paginas, da la vuelta a 0-47). Los trozos 28-39 y
-  las fuentes caen dentro del buffer de la pagina 160 y se pisan con el dibujo: bloques del video viejos arriba y una
-  banda de basura de fuentes. Traza de las subidas (TRXDIR): todas son `dbw=2` (128 de ancho), CT32, trozos de 128x64
-  (128 bloques cada uno) de 1536 a 6528, y luego 6656 (128x128), 6912/7456/8000 (16x16) y 6944/7488 (128x256): el propio
-  juego pide esas direcciones, el runtime no las mueve. El hueco libre real son las paginas 48-159. Falta ver por que la cache de texturas de
-  RenderWare no vuelve al principio en el limite (hipotesis: calcula el limite con buffers de 640x256). El intercambio de
-  buffers (`sceGsSwapDBuffDc`) es correcto (igual que la libgraph del juego en 0x101B30).
+- Hasta donde llega ahora: la escena de entrada del nivel 1 se dibuja entera (hito 11) y la partida se juega: el mundo
+  del nivel se ve (calles, edificios, cielo; hito 15), la camara sigue al movimiento del stick por las calles y
+  callejones (hitos 16 a 18), CUADRADO da un truco que suma 200 puntos, el tiempo baja de 2:30 y salen los avisos del
+  retrato ("X to jump further!", "GCP heavies are on the street"). Sin cuelgues ni hilos muertos hasta el VSync 5500
+  (tiempo 1:31), unos 6 minutos reales desde el arranque. No se ha llegado al final del nivel.
+- Pendiente 1 (resuelto, mundo negro en la partida): desde el VSync ~2650 (fin de la escena) solo se veia el HUD. Las 86
+  tiras por imagen salian con todos los vertices en el centro de la pantalla y q = FLT_MAX porque la matriz camara x
+  proyeccion que el EE sube al VU1 (qwords 0x3F0-0x3F3 del bloque de constantes, `UNPACK V4-32 num=13 addr=0x3F0`)
+  llegaba a cero. Siguiendo hacia atras (RwCameraBeginUpdate: `viewMatrix` en +0x20 de la camara, LTM del marco en
+  +0x50, `RwMatrixMultiply` en 0x1C7340): el marco de la camara de juego tenia la parte de rotacion a cero, porque el
+  controlador de la camara la construye normalizando vectores con FPU y VU0, y tres instrucciones se traducian mal:
+  - `SQRT.S fd, ft`: en el R5900 el operando esta en el campo ft (fs no se usa); el traductor leia fs (normalmente 0),
+    asi que toda raiz daba 0 y cada normalizacion, 0 o infinito. Afectaba a 27 archivos generados.
+  - `CVT.W.S`: el R5900 trunca y satura a INT32_MIN/INT32_MAX (como PCSX2); el runtime redondeaba al mas cercano
+    (`nearbyintf`) y desbordaba con valores grandes.
+  - Macros de VU0 `vdiv`/`vsqrt`/`vrsqrt`: deben escribir el registro Q (con las reglas de division por cero del
+    R5900, +-MAX, y 0/0 = 0 con signo en `vrsqrt`), que es lo que lee el `vmulq` siguiente; `vrsqrt` calcula
+    fs/sqrt(ft), no 1/sqrt(ft).
+  Arreglo en `ps2recomp-fpu-vu0-r5900.patch` (traductor + `ps2_runtime_macros.h`) y codigo regenerado. Con eso la matriz
+  sale bien en todas las imagenes y el mundo del nivel 1 se ve (hito 15).
+- Bloqueo 10 (resuelto): en la primera imagen de la partida el hilo principal moria con `[guest-branch:missing-target]`
+  (salto a 0x1FFF990, basura de la pila). Cadena recursiva 0x183BB0 -> 0x183C40 -> 0x184340 -> `jalr` 0x183BB0. El
+  planificador expropio el hilo en un punto seguro dentro de la llamada interior; al volver, el `dispatchGuestBranch`
+  exterior vio `pc == entryPc` (la misma funcion, por la recursion), creyo que la llamada habia terminado y siguio en
+  la instruccion siguiente con `sp` y `ra` del marco interior. `ps2recomp-dispatch-unwind.patch` marca en un indicador
+  por hilo que se esta deshaciendo la pila hasta el planificador; mientras esta puesto, ningun `dispatchGuestBranch`
+  continua en la instruccion siguiente: todos devuelven hasta el planificador, que reanuda en el `pc` guardado.
+- Pendiente 2 (resuelto, menu corrupto y banda de basura arriba en la escena del nivel): cada imagen el menu sube el
+  video de fondo (MENUBASE.M2V, 640x512) como 40 trozos CT32 de 128x64 en los bloques 1536..6655 y las fuentes detras
+  (hasta ~8032), pero los buffers de pantalla estan en las paginas 160 y 320 (bloques 5120 y 10240): los trozos 28-39 y
+  las fuentes se pisaban con el dibujo. Causa (en el juego, no en el runtime): el juego elige el modo de RenderWare 38
+  (0x22B7D0; tabla de modos en 0x2E46D0: 640x512, 32 bits, flags 0x13). El arranque del video del driver sky2
+  (0x1E8B00-0x1E9600) llama a `sceGsSetDefDBuffDc` y, por ser entrelazado, desplaza FBP/ZBP 160 paginas: dibujo en las
+  paginas 160 y 320 (entornos en 0x32ED10/0x32EE80) y Z16S en la 480, que da la vuelta a las 0-47. Guarda el final de
+  la VRAM ocupada sin dar la vuelta (gp-0x7890 = 0x118000 palabras, pagina 560) y desde 0x1E95C8 inicia la cache de
+  texturas (0x1F39E0, inicio y tamano en palabras) con tamano 0x100000 - inicio: negativo. La cache cree tener casi
+  4 GB, nunca vuelve al principio y sus direcciones, truncadas a 14 bits en BITBLTBUF/TEX0, avanzan desde la pagina 48
+  hasta pasar la 160. Override en `runner/blade_overrides.cpp`: si el inicio pasa de 4 MB o el tamano es mayor, da la
+  vuelta al inicio y acaba la cache en el primer buffer de dibujo (paginas 48-159). Con eso las subidas llegan como
+  mucho al bloque 5119; menu principal, seleccion de partida, un jugador, modo historia y la escena "hideaway" del
+  nivel 1 salen limpios (antes con trozos del video viejos y basura de fuentes arriba). Falta saber por que en la
+  consola no pasa: con el mismo codigo, algun dato de entrada del calculo (p. ej. algo que el runtime devuelve al
+  driver al elegir el modo) debe de ser distinto; el override no depende de eso. El intercambio de buffers (`sceGsSwapDBuffDc`) es correcto (igual que la
+  libgraph del juego en 0x101B30).
+- Graficos sin revisar contra una consola: la columna de paneles blancos a la derecha del menu son abanicos sin textura
+  `rgba=255,255,255,128` con `ALPHA=0x48` (Cs*As + Cd, aditivo): el blanco saturado es lo que pide el juego. En la
+  escena de entrada del nivel 1 un edificio sale como silueta negra (geometria del VU1). El mundo negro de la partida era
+  la matriz de camara nula (Pendiente 1, resuelto en la FPU/VU0), no el GS.
+- Pendiente 4 (jugador invisible): en la partida no se dibuja el personaje (ni la tabla), aunque el mundo, el HUD y las
+  estelas del boost si salen. Sin investigar. Hipotesis: la camara de juego queda dentro o muy cerca del jugador (en un
+  volcado de RAM, posicion y objetivo del controlador de camara, estructura en 0x1EC9E68 con objetivo en +0x58, estaban
+  a ~1.17 unidades) o el pipeline con piel (RpSkin, matrices de huesos por VU1) da geometria fuera de pantalla; otra
+  instruccion de FPU/VU0 mal traducida es sospechosa, igual que en Pendiente 1.
 - Pendiente 3: rendimiento. En el nivel van unos 6 VSync por segundo real (14 en el menu). Perfil de 10 s con `sample`
   durante la entrada: el rasterizador por CPU (`SampleTexture` + `WritePixel` + `Submit` + `ReadTexture`, unas 4 900
   muestras) y el interprete de VU1 (`commitReadyPipelines`, `calculatePairReadyCycle`, `execUpper`..., unas 2 800) se

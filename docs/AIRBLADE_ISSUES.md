@@ -1,0 +1,42 @@
+# AIRBLADE_ISSUES (QA independiente, 2026-11-11)
+Severidad: P0 bloquea todo, P1 impide jugar bien, P2 defecto visible/funcional, P3 menor o infraestructura, P4 higiene.
+Estado QA: OPEN / FIXED-BUILT (no certificado) / CERTIFIED. Evidencia en `scratchpad/hitos/qa_*.png` y `qa/`.
+
+| ID | Subsistema | Sev | Pasos | Esperado | Actual | Hipotesis (conf.) | Resp. | Estado |
+|---|---|---|---|---|---|---|---|---|
+| AB-001 | rendimiento | P1 | guion del README, medir V/s | 50 V/s | menu 35, partida 7-13 V/s (carga baja); EE al 98 % de un nucleo + GS 84 % | VU1 interprete y VIF1 en el hilo EE (61-84 %), rasterizador por CPU | dev 2 | OPEN (dev 2: partida 11-25) |
+| AB-002 | tiempo | P1 | leer cronometro del HUD | VBlank PAL 50 Hz | VBlank fijo a 16 667 us (60 Hz); el cronometro cuenta 50 VSync/s | `kVBlankPeriod` fijo (95 %) | dev 2 | FIXED-BUILT: menu 50,0 V/s medidos; sin certificar el resto |
+| AB-003 | audio | P1 | escuchar/volcar | musica y efectos | LIBSD/TSSDRV sin mezcla en la linea base (README) | SPU2 sin mezclador (95 %) | dev 3 | FIXED-BUILT: WAV 72,05 s, musica desde 8 s; sin referencia (UNVERIFIED) |
+| AB-004 | graficos/jugador | P1 | VSync ~3000-5200 | jugador sobre la tabla, con sombra | figura de pie, sin tabla ni sombra visibles (qa_jugador_zoom_3000, hito 20) | atomico de la tabla no se dibuja o va transparente (50 %); o el modo historia empieza sin tabla (hay que confirmar con PCSX2) | dev 1 | OPEN |
+| AB-005 | graficos/menus | P3 | menu principal (VSync 650-1100) | panel traslucido sobre el video | columna blanca opaca con lineas oscuras (qa_baseline_650) | color/alfa del abanico o mascara faltante (30 %) | dev 1 | OPEN, UNVERIFIED vs PCSX2 |
+| AB-006 | graficos | P2 | escena de entrada, VSync ~1950 | pared texturada | pared del edificio negra plana (qa_intro_edificio_negro_1950); en el 2050 el pasillo si sale texturado | lote del VU1 con color/textura nulos (40 %) | dev 1 | OPEN |
+| AB-007 | graficos | P2 | partida, VSync 3000-3160 | cara inferior del voladizo iluminada/texturada | negro plano (qa_baseline_3000, qa_sheet_partida) | igual que AB-006 | dev 1 | OPEN |
+| AB-008 | graficos | P3 | VSync ~2450 (corte entre intro y juego) | transicion | un fotograma con skyline y mitad inferior gris plano (qa_intro_suelo_gris_2450); mas cortes parecidos en 3250, 4750, 5000 con el nivel en marcha | suelo aun no dibujado en el corte; ver si el juego lo hace (30 %) | dev 1 | OPEN, UNVERIFIED |
+| AB-009 | QA/infraestructura | P3 | repetir el guion dos veces | mismos fotogramas | ejecuciones no reproducibles: baseline vs baseline difiere en 66 de 69 fotogramas; dev 2 vs dev 2 (sin entrada) mediana de dif. 22 | acoplamiento con tiempo real (pasos del guion de 150 ms reales, plazos de host) (60 %) | dev 2 / QA | OPEN |
+| AB-010 | QA | P3 | guion README con 50 V/s | mismo flujo | con el build de dev 2 el guion se desfasa: titulo hasta VSync 1750, menu equivocado, el nivel queda en cronometro 2:30,00 durante 4000 VSync hasta pulsar X de nuevo | pulsaciones por VSync fijas (80 %) | QA | OPEN: hacer el guion por evento |
+| AB-011 | build | P2 | `git apply` de los parches sobre e563698 limpio y compilar | reproducible | los 13 parches de dev 2 aplican, pero su `third_party` tiene codigo no parcheado (`PS2X_VU1_PROFILE`) y su `blade_devtools.cpp` entregado referencia `ps2xVu1Replay`: enlace falla (simbolo sin definir) con los parches entregados | parche `vu1-record` posterior (ahora en su carpeta, 15 parches) | dev 2 | OPEN hasta recertificar |
+| AB-012 | pruebas | P3 | `-DPS2X_IOP_BUILD_TESTS=ON` y compilar `ps2_iop_spu2_dsp_tests` | compila | falla: `std::clamp`/`int32_t` sin incluir en `spu2_dsp.h`; el `spu2_mix_tests` no esta registrado en CMake (solo compilacion manual) | falta `#include <algorithm>`/`<cstdint>` (90 %) | dev 3 | OPEN (ambas pruebas pasan con la orden manual) |
+| AB-013 | higiene | P4 | `git status` | limpio | restos de depuracion sin commitear: `BLADE_PTRACE`/`BLADE_GSTRACE`/`TMPTRACE` en `gs_cpu_backend.cpp`, `ovAtomRender` (`BLADE_ATRACE`) en `blade_overrides.cpp` | -- | dev 1 | OPEN |
+| AB-014 | memoria | P3 | `time -l` | estable | maximo residente 2,6 / 6,6 / 7,8 GB en ejecuciones equivalentes | cache de texturas o colas del GS (20 %) | dev 2 | OPEN, UNVERIFIED |
+| AB-015 | audio/tiempo real | P2 | partida a 12 V/s con el mezclador | sonido continuo | el mezclador avanza con el reloj del IOP (VSync), no del host: a 0,25 x tiempo real el audio reproducido en vivo se cortaria o iria lento; no probado con altavoces | -- | dev 3 | UNVERIFIED |
+| AB-016 | audio | P3 | MVOL core 1 | valor del juego | el juego deja MVOL=0; el mezclador usa 1,0 por defecto ("assume"); modo `strict` = silencio | el volumen real lo fija otra ruta (hipotesis, no hecho) | dev 3 | UNVERIFIED |
+
+## Actualizacion AB-009/AB-010 (modo determinista)
+Resuelto con PS2X_DETERMINISTIC=1 + runner/qa_deterministic.cpp (entrada por tick de VSync, BLADE_DET_*).
+Evidencia: dos corridas A y A2 hasta VSync 3950: 78 hashes (RAM 32 MB + frame) identicos y 79/79 PNG identicos byte a byte.
+Parche de runtime solo QA: qa/patches/qa-deterministic-eescheduler.diff (no forma parte de la serie del producto; avisar al coordinador).
+Con BLADE_NO_SKYWAIT=1 (dev 2) la RAM diverge desde el tick 1600 pero los 79 PNG son identicos a la corrida con skywait.
+Correccion: el hash de frame NO difiere; solo la RAM. Los 78 hashes de frame de la corrida sin skywait coinciden con los de la corrida con skywait (mi lectura anterior era un error al comparar solo un lado del diff). El alfa se fuerza a 0xFF antes de hashear, asi que no interviene.
+
+## Para dev 1: reproducir AB-004 en modo determinista (ronda 2)
+Binario: qa/blade_recomp.det (serie completa de 16 parches con z-deterministic + dev 2 + dev 3). Lanzador: qa/det_run.sh. Instrucciones: runner/README_DETERMINISTIC.md.
+Guion BLADE_DET_INPUT que llega al nivel 1 (tutorial, cronometro 2:17) en el tick ~3000 y lo mantiene hasta 3950:
+    300:START;400:START;500:START;600:START;700:START;900:CROSS;1050:CROSS;1200:CROSS;2250:CROSS;2400:CROSS
+Orden:  PS2X_DETERMINISTIC=1 BLADE_HIDDEN=1 BLADE_DET_INPUT="<guion>" BLADE_DET_DUMP=salida,1,3195 BLADE_DET_HASH=10,3195 BLADE_DET_EXIT=3265 qa/blade_recomp.det disc/SCES_502.46
+(~6 min para llegar al tick 3265; cada ejecucion con el mismo guion es identica; referencias con hash en qa/ref_det/hash.txt).
+Biseccion del jugador (figura de pie, pantalones verdes, a media distancia): con este guion la figura SE DIBUJA en todos los ticks volcados: cada tick de 3195 a 3265, cada 2 ticks de 3350 a 3402, y cada 50 hasta 3950 (en 3450 y siguientes sigue visible, mas pequena; el recuadro de tutorial aparece desde ~3350). No he podido reproducir una desaparicion entre 3210 y 3240. Hipotesis: lo visto por dev 1 depende de entrada/tiempo de reloj distinto (otro flujo del guion) o de otra figura; con el modo determinista puede fijar su guion exacto con BLADE_DET_INPUT y volcar tick a tick. PNG en qa/det/BIS (3195-3265) y qa/det/BIS2 (3350-3402).
+Observacion: esta figura camina sin tabla ni sombra visible, que es lo descrito en AB-004; sigue sin comparacion con PCSX2 (UNVERIFIED).
+
+## Tick 3240 en modo normal vs determinista (ronda 2)
+Dos corridas en modo NORMAL (sin PS2X_DETERMINISTIC, ritmo de reloj de pared, carga del Mac ~90) con la entrada por tick (BLADE_DET_INPUT) y volcado cada 10 ticks de 3200 a 3260: los 7 PNG de cada corrida son identicos a los de la corrida determinista, y los hashes de RAM y frame en 3200, 3240 y 3250 coinciden con los de la determinista (p. ej. 3240: ram=640104e166ffd756 frame=bd95c17e574e7469). El jugador se dibuja en 3240 en ambos modos.
+Conclusion: la no reproducibilidad observada antes venia de la entrada con reloj de pared (pulsaciones de 150 ms reales); con la entrada anclada al VSync del juego, el modo normal tambien es reproducible en estos ticks. PS2X_DETERMINISTIC garantiza ademas independencia de la carga, pero no es lo que cambia el resultado aqui. Lo que dev 1 vio (desaparicion 3210-3240) hay que reproducirlo con el guion tick-exacto; con el nuestro no ocurre.

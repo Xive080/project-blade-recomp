@@ -1,0 +1,48 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index a2c116b..93b63a4 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -509,24 +509,19 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
+         status |= flags;
+     }
+ 
+-    FlagPipelineEntry *entry = nullptr;
+-    for (FlagPipelineEntry &candidate : m_flagPipeline)
+-    {
+-        if (!candidate.valid)
+-        {
+-            entry = &candidate;
+-            break;
+-        }
+-    }
+-    if (!entry)
++    // m_flagMask refleja exactamente las entradas validas: el primer hueco libre es su primer bit a 0
++    // (el mismo que encontraba el recorrido lineal).
++    const uint32_t freeIndex = static_cast<uint32_t>(std::countr_zero(~m_flagMask));
++    if (freeIndex >= kMaxFlagEntries)
+     {
+         reportReservedInstruction(true, 0xFFFFFFFFu);
+         return;
+     }
+ 
++    FlagPipelineEntry *entry = &m_flagPipeline[freeIndex];
+     *entry = {};
+     entry->valid = true;
+-    m_flagMask |= 1u << static_cast<uint32_t>(entry - m_flagPipeline.data());
++    m_flagMask |= 1u << freeIndex;
+     entry->issueCycle = m_cycle;
+     entry->readyCycle = m_cycle + kFmacLatency;
+     entry->mac = mac;
+@@ -1660,9 +1655,11 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
+     const uint64_t budgetEnd = m_cycle + maxCycles;
+     bool programEnded = false;
++    // Al final de cada vuelta advanceOneCycle ya hace visibles los resultados listos en el ciclo nuevo
++    // y entre medias no se encola nada: basta con hacerlo una vez antes del bucle.
++    commitReadyPipelines();
+     while (m_cycle < budgetEnd && !m_stopRequested)
+     {
+-        commitReadyPipelines();
+         if (m_state.pc + 8u > codeSize)
+             break;
+ 

@@ -1,0 +1,392 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
+index f7d5403..bb1593d 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1.h
+@@ -35,8 +35,12 @@ struct VU1State
+     uint32_t branchDelay;
+ };
+ 
++struct VU1Internal; // acceso a lo privado desde las herramientas (grabador/reproductor, microprogramas compilados)
++
+ class VU1Interpreter
+ {
++    friend struct VU1Internal;
++
+ public:
+     enum class Unit : uint8_t
+     {
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 0b85381..2103e10 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -16,6 +16,8 @@
+ #include <chrono>
+ #include <limits>
+ #include <map>
++#include <string>
++#include <vector>
+ #include <utility>
+ #include <ps2_log.h>
+ 
+@@ -98,6 +100,326 @@ namespace
+     }
+ }
+ 
++// ---------------------------------------------------------------------------------------------------------
++// Grabador y reproductor de llamadas al VU1 (PS2X_VU1_RECORD=fichero[,desde[,cuantas]] y
++// BLADE_VU1_REPLAY=fichero en el ejecutable del juego). Por cada execute()/resume() guarda el estado de entrada
++// (VU1State, argumentos, cambios de la memoria de datos desde la salida de la llamada anterior y, cuando cambia, el
++// microcodigo) y el de salida (VU1State, ciclos, hash de la memoria de datos y hash de los paquetes GIF de XGKICK).
++// Reproducir ejecuta cada llamada en un interprete nuevo y compara todo: es la red de seguridad de cualquier
++// cambio del interprete o de microprogramas compilados. Solo se reproducen llamadas que acaban con las tuberias
++// vacias (las demas se cuentan como "no reproducibles").
++// ---------------------------------------------------------------------------------------------------------
++struct VU1Internal
++{
++    static uint64_t cycle(const VU1Interpreter &vu) { return vu.m_cycle; }
++    static bool pipelinesPending(const VU1Interpreter &vu) { return vu.pipelinesPending(); }
++    static void prepareReplay(VU1Interpreter &vu) { vu.m_workingClip = vu.m_state.clip; }
++};
++
++namespace
++{
++    struct GifTap
++    {
++        bool hashing = false;  // acumula el hash de los paquetes
++        bool suppress = false; // no los manda al GS (reproduccion)
++        uint64_t hash = 1469598103934665603ull;
++        uint32_t count = 0;
++    };
++    GifTap g_gifTap;
++
++    inline uint64_t fnvBytes(uint64_t h, const uint8_t *p, size_t n)
++    {
++        for (size_t i = 0; i < n; ++i)
++            h = (h ^ p[i]) * 1099511628211ull;
++        return h;
++    }
++    inline uint64_t fnvWords(const uint8_t *p, size_t n)
++    {
++        uint64_t h = 1469598103934665603ull;
++        size_t i = 0;
++        for (; i + 8u <= n; i += 8u)
++        {
++            uint64_t w;
++            std::memcpy(&w, p + i, 8);
++            h = (h ^ w) * 1099511628211ull;
++        }
++        return fnvBytes(h, p + i, n - i);
++    }
++    constexpr uint32_t kRecData = 0x4000u;
++    constexpr uint32_t kRecChunk = 64u;
++
++    template <typename T>
++    void put(std::vector<uint8_t> &b, const T &v)
++    {
++        const size_t at = b.size();
++        b.resize(at + sizeof(T));
++        std::memcpy(b.data() + at, &v, sizeof(T));
++    }
++
++    bool sameState(const VU1State &a, const VU1State &b, const char *&field)
++    {
++        const auto eqf = [](const float *x, const float *y, size_t n)
++        { return std::memcmp(x, y, n * sizeof(float)) == 0; };
++#define VU1_CHK(cond, name) \
++    if (!(cond))            \
++    {                       \
++        field = name;       \
++        return false;       \
++    }
++        VU1_CHK(eqf(&a.vf[0][0], &b.vf[0][0], 128), "vf");
++        VU1_CHK(std::memcmp(a.vi, b.vi, sizeof(a.vi)) == 0, "vi");
++        VU1_CHK(eqf(a.acc, b.acc, 4), "acc");
++        VU1_CHK(eqf(&a.q, &b.q, 1), "q");
++        VU1_CHK(eqf(&a.p, &b.p, 1), "p");
++        VU1_CHK(eqf(&a.i, &b.i, 1), "i");
++        VU1_CHK(a.r == b.r, "r");
++        VU1_CHK(a.pc == b.pc, "pc");
++        VU1_CHK(a.mac == b.mac, "mac");
++        VU1_CHK(a.clip == b.clip, "clip");
++        VU1_CHK(a.status == b.status, "status");
++        VU1_CHK(a.ebit == b.ebit && a.haltAfterDelaySlot == b.haltAfterDelaySlot, "ebit/halt");
++        VU1_CHK(a.dBitEnabled == b.dBitEnabled && a.tBitEnabled == b.tBitEnabled, "d/t enable");
++        VU1_CHK(a.stoppedByD == b.stoppedByD && a.stoppedByT == b.stoppedByT, "stopped");
++        VU1_CHK(a.top == b.top && a.itop == b.itop, "top/itop");
++        VU1_CHK(a.branchPending == b.branchPending && a.branchTarget == b.branchTarget && a.branchDelay == b.branchDelay, "branch");
++#undef VU1_CHK
++        return true;
++    }
++
++    struct Vu1Rec
++    {
++        FILE *file = nullptr;
++        bool on = false, cur = false;
++        uint64_t from = 0, count = 4000, seen = 0, written = 0, unclean = 0;
++        std::vector<uint8_t> prevPost = std::vector<uint8_t>(kRecData, 0u);
++        uint64_t lastGen = ~0ull;
++        std::vector<uint8_t> buf;
++        uint64_t c0 = 0;
++        Vu1Rec()
++        {
++            const char *e = std::getenv("PS2X_VU1_RECORD");
++            if (!e || !*e)
++                return;
++            std::string spec(e);
++            std::string path = spec.substr(0, spec.find(','));
++            size_t pos = spec.find(',');
++            if (pos != std::string::npos)
++            {
++                from = std::strtoull(spec.c_str() + pos + 1, nullptr, 10);
++                pos = spec.find(',', pos + 1);
++                if (pos != std::string::npos)
++                    count = std::strtoull(spec.c_str() + pos + 1, nullptr, 10);
++            }
++            file = std::fopen(path.c_str(), "wb");
++            if (!file)
++                return;
++            std::fwrite("VU1REC01", 1, 8, file);
++            const uint32_t sizes[2] = {0x4000u, kRecData};
++            std::fwrite(sizes, sizeof(sizes), 1, file);
++            on = true;
++            g_gifTap.hashing = true;
++        }
++        ~Vu1Rec() { close(); }
++        void close()
++        {
++            if (file)
++            {
++                std::fclose(file);
++                file = nullptr;
++                std::fprintf(stderr, "[vu1rec] %llu llamadas grabadas (%llu no reproducibles)\n", (unsigned long long)written,
++                             (unsigned long long)unclean);
++            }
++            on = false;
++            g_gifTap.hashing = false;
++        }
++        void begin(uint8_t kind, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, const VU1State &pre, const uint8_t *code,
++                   uint32_t codeSize, const uint8_t *data, uint32_t dataSize, uint64_t gen, uint64_t cycle)
++        {
++            cur = false;
++            if (!on)
++                return;
++            if (++seen <= from)
++                return;
++            if (written >= count || codeSize != 0x4000u || dataSize != kRecData)
++            {
++                if (written >= count)
++                    close();
++                return;
++            }
++            cur = true;
++            c0 = cycle;
++            g_gifTap.hash = 1469598103934665603ull;
++            g_gifTap.count = 0;
++            if (gen != lastGen)
++            {
++                lastGen = gen;
++                const uint8_t tag = 'C';
++                std::fwrite(&tag, 1, 1, file);
++                std::fwrite(code, 1, codeSize, file);
++            }
++            buf.clear();
++            put(buf, static_cast<uint8_t>('K'));
++            put(buf, kind);
++            put(buf, a0);
++            put(buf, a1);
++            put(buf, a2);
++            put(buf, a3);
++            put(buf, pre);
++            uint32_t changed = 0;
++            const size_t countAt = buf.size();
++            put(buf, changed);
++            for (uint32_t c = 0; c < kRecData / kRecChunk; ++c)
++            {
++                if (std::memcmp(data + c * kRecChunk, prevPost.data() + c * kRecChunk, kRecChunk) != 0)
++                {
++                    put(buf, static_cast<uint16_t>(c));
++                    const size_t at = buf.size();
++                    buf.resize(at + kRecChunk);
++                    std::memcpy(buf.data() + at, data + c * kRecChunk, kRecChunk);
++                    ++changed;
++                }
++            }
++            std::memcpy(buf.data() + countAt, &changed, sizeof(changed));
++        }
++        void end(const VU1State &post, uint64_t cycle, bool clean, const uint8_t *data)
++        {
++            if (!cur)
++                return;
++            cur = false;
++            put(buf, post);
++            put(buf, static_cast<uint64_t>(cycle - c0));
++            put(buf, static_cast<uint8_t>(clean ? 1 : 0));
++            put(buf, fnvWords(data, kRecData));
++            put(buf, g_gifTap.hash);
++            put(buf, g_gifTap.count);
++            std::fwrite(buf.data(), 1, buf.size(), file);
++            std::memcpy(prevPost.data(), data, kRecData);
++            ++written;
++            if (!clean)
++                ++unclean;
++            if (written >= count)
++                close();
++        }
++    };
++    Vu1Rec g_vu1Rec;
++
++    // Guarda la entrada al abrirse y la salida al cerrarse (execute y resume).
++    struct Vu1RecScope
++    {
++        const VU1Interpreter &vu;
++        const uint8_t *data;
++        uint32_t dataSize;
++        bool active = false;
++        Vu1RecScope(const VU1Interpreter &v, uint8_t kind, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
++                    const uint8_t *code, uint32_t codeSize, const uint8_t *d, uint32_t ds, uint64_t gen, bool isVu1)
++            : vu(v), data(d), dataSize(ds)
++        {
++            if (!g_vu1Rec.on || !isVu1)
++                return;
++            active = true;
++            g_vu1Rec.begin(kind, a0, a1, a2, a3, v.state(), code, codeSize, d, ds, gen, VU1Internal::cycle(v));
++        }
++        ~Vu1RecScope()
++        {
++            if (active)
++                g_vu1Rec.end(vu.state(), VU1Internal::cycle(vu), !VU1Internal::pipelinesPending(vu), data);
++        }
++    };
++}
++
++int ps2xVu1Replay(const char *path)
++{
++    FILE *f = std::fopen(path, "rb");
++    if (!f)
++    {
++        std::fprintf(stderr, "[vu1replay] no se puede abrir %s\n", path);
++        return 2;
++    }
++    char magic[8];
++    uint32_t sizes[2];
++    if (std::fread(magic, 1, 8, f) != 8 || std::memcmp(magic, "VU1REC01", 8) != 0 || std::fread(sizes, sizeof(sizes), 1, f) != 1)
++    {
++        std::fprintf(stderr, "[vu1replay] formato no valido\n");
++        return 2;
++    }
++    VU1Interpreter rep(VU1Interpreter::Unit::VU1);
++    GS gs;
++    std::vector<uint8_t> code(sizes[0], 0u), data(sizes[1], 0u);
++    g_gifTap.hashing = true;
++    g_gifTap.suppress = true;
++    uint64_t calls = 0, ok = 0, bad = 0, skipped = 0;
++    const auto t0 = std::chrono::steady_clock::now();
++    for (;;)
++    {
++        uint8_t tag = 0;
++        if (std::fread(&tag, 1, 1, f) != 1)
++            break;
++        if (tag == 'C')
++        {
++            if (std::fread(code.data(), 1, code.size(), f) != code.size())
++                break;
++            continue;
++        }
++        if (tag != 'K')
++            break;
++        uint8_t kind = 0;
++        uint32_t a[4];
++        VU1State pre{}, post{};
++        uint32_t changed = 0;
++        bool good = std::fread(&kind, 1, 1, f) == 1 && std::fread(a, sizeof(a), 1, f) == 1 && std::fread(&pre, sizeof(pre), 1, f) == 1 &&
++                    std::fread(&changed, sizeof(changed), 1, f) == 1;
++        for (uint32_t i = 0; good && i < changed; ++i)
++        {
++            uint16_t idx = 0;
++            good = std::fread(&idx, sizeof(idx), 1, f) == 1 && (idx + 1u) * kRecChunk <= data.size() &&
++                   std::fread(data.data() + idx * kRecChunk, 1, kRecChunk, f) == kRecChunk;
++        }
++        uint64_t cyc = 0, dataHash = 0, gifHash = 0;
++        uint8_t clean = 0;
++        uint32_t gifCount = 0;
++        good = good && std::fread(&post, sizeof(post), 1, f) == 1 && std::fread(&cyc, sizeof(cyc), 1, f) == 1 &&
++               std::fread(&clean, 1, 1, f) == 1 && std::fread(&dataHash, sizeof(dataHash), 1, f) == 1 &&
++               std::fread(&gifHash, sizeof(gifHash), 1, f) == 1 && std::fread(&gifCount, sizeof(gifCount), 1, f) == 1;
++        if (!good)
++            break;
++        ++calls;
++        rep.state() = pre;
++        VU1Internal::prepareReplay(rep);
++        g_gifTap.hash = 1469598103934665603ull;
++        g_gifTap.count = 0;
++        const uint64_t c0 = VU1Internal::cycle(rep);
++        if (kind == 0)
++            rep.execute(code.data(), sizes[0], data.data(), sizes[1], gs, nullptr, a[0], a[1], a[2], a[3]);
++        else
++            rep.resume(code.data(), sizes[0], data.data(), sizes[1], gs, nullptr, a[1], a[2], a[3]);
++        if (!clean)
++        {
++            ++skipped;
++            continue;
++        }
++        const char *field = "";
++        const bool sameSt = sameState(rep.state(), post, field);
++        const uint64_t dCyc = VU1Internal::cycle(rep) - c0;
++        const uint64_t dh = fnvWords(data.data(), data.size());
++        if (sameSt && dCyc == cyc && dh == dataHash && g_gifTap.hash == gifHash && g_gifTap.count == gifCount)
++            ++ok;
++        else
++        {
++            if (++bad <= 5)
++                std::fprintf(stderr, "[vu1replay] DIFERENCIA en la llamada %llu (%s, arranque 0x%x): estado=%s (%s) ciclos %llu/%llu datos=%s gif=%s\n",
++                             (unsigned long long)calls, kind == 0 ? "execute" : "resume", a[0], sameSt ? "ok" : "distinto", field,
++                             (unsigned long long)dCyc, (unsigned long long)cyc, dh == dataHash ? "ok" : "distintos",
++                             (g_gifTap.hash == gifHash && g_gifTap.count == gifCount) ? "ok" : "distinto");
++        }
++    }
++    std::fclose(f);
++    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
++    std::printf("[vu1replay] %llu llamadas: %llu identicas, %llu distintas, %llu no reproducibles; %.2f s\n", (unsigned long long)calls,
++                (unsigned long long)ok, (unsigned long long)bad, (unsigned long long)skipped, secs);
++    std::fflush(stdout);
++    return bad == 0 && ok > 0 ? 0 : 1;
++}
++
+ namespace
+ {
+     constexpr uint8_t laneForComponent(uint32_t component)
+@@ -1018,6 +1340,16 @@ void VU1Interpreter::finishXgkick()
+     if (!m_xgkick.active)
+         return;
+ 
++    if (g_gifTap.hashing)
++    {
++        g_gifTap.hash = fnvBytes(g_gifTap.hash, m_xgkick.packet.data(), m_xgkick.totalBytes) ^ (static_cast<uint64_t>(m_xgkick.totalBytes) << 32);
++        ++g_gifTap.count;
++        if (g_gifTap.suppress)
++        {
++            m_xgkick.active = false;
++            return;
++        }
++    }
+     if (m_activeMemory)
+         m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
+     else if (m_activeGs)
+@@ -1695,6 +2027,8 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
+                              uint32_t startPC, uint32_t top, uint32_t itop,
+                              uint32_t maxCycles)
+ {
++    Vu1RecScope recScope(*this, 0, startPC, top, itop, maxCycles, vuCode, codeSize, vuData, dataSize,
++                         memory ? memory->getVU1CodeGeneration() : 0u, m_unit == Unit::VU1);
+     resetScheduler();
+     m_state.pc = startPC & microAddressMask();
+     m_state.ebit = false;
+@@ -1733,6 +2067,8 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
+                             GS &gs, PS2Memory *memory,
+                             uint32_t top, uint32_t itop, uint32_t maxCycles)
+ {
++    Vu1RecScope recScope(*this, 1, 0, top, itop, maxCycles, vuCode, codeSize, vuData, dataSize,
++                         memory ? memory->getVU1CodeGeneration() : 0u, m_unit == Unit::VU1);
+     m_state.top = top;
+     m_state.itop = itop;
+     m_state.stoppedByD = false;

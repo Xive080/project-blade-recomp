@@ -1,0 +1,96 @@
+diff --git a/ps2xRecomp/src/lib/mmi_translation_helpers.cpp b/ps2xRecomp/src/lib/mmi_translation_helpers.cpp
+index a2bcb77..9a284a4 100644
+--- a/ps2xRecomp/src/lib/mmi_translation_helpers.cpp
++++ b/ps2xRecomp/src/lib/mmi_translation_helpers.cpp
+@@ -454,17 +454,16 @@ namespace ps2recomp
+ 
+     std::string CodeGenerator::translatePEXEH(const Instruction &inst)
+     {
+-        // Swaps halfwords 1<->3 and 5<->7 within the 128-bit register
+-        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shufflelo_epi16(_mm_shufflehi_epi16(GPR_VEC(ctx, {}), _MM_SHUFFLE(2,3,0,1)), _MM_SHUFFLE(2,3,0,1)));",
++        // Exchanges halfwords 0<->2 in each 64-bit half (PS2_PEXEH)
++        return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PEXEH(GPR_VEC(ctx, {})));",
+                            inst.rd, inst.rt);
+     }
+ 
+ 
+     std::string CodeGenerator::translatePREVH(const Instruction &inst)
+     {
+-        // Reverses the order of the 8 halfwords
+-        return fmt::format("{{ __m128i mask = _mm_setr_epi8(14,15, 12,13, 10,11, 8,9, 6,7, 4,5, 2,3, 0,1); "
+-                           "SET_GPR_VEC(ctx, {}, PS2_SHUFFLE_EPI8(GPR_VEC(ctx, {}), mask)); }}",
++        // Reverses the four halfwords of each 64-bit half (PS2_PREVH)
++        return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PREVH(GPR_VEC(ctx, {})));",
+                            inst.rd, inst.rt);
+     }
+ 
+@@ -520,8 +519,8 @@ namespace ps2recomp
+ 
+     std::string CodeGenerator::translatePROT3W(const Instruction &inst)
+     {
+-        // Rotates words left by 3: [d,c,b,a] -> [a,d,c,b]
+-        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shuffle_epi32(GPR_VEC(ctx, {}), _MM_SHUFFLE(0,3,2,1)));",
++        // Rotates words 0..2 (w0 = w1, w1 = w2, w2 = w0), word 3 is kept (PS2_PROT3W)
++        return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PROT3W(GPR_VEC(ctx, {})));",
+                            inst.rd, inst.rt);
+     }
+ 
+@@ -560,8 +559,8 @@ namespace ps2recomp
+ 
+     std::string CodeGenerator::translatePEXCH(const Instruction &inst)
+     {
+-        // Parallel Exchange Center Halfword (same as MMI2 PEXEH)
+-        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shufflelo_epi16(_mm_shufflehi_epi16(GPR_VEC(ctx, {}), _MM_SHUFFLE(2,3,0,1)), _MM_SHUFFLE(2,3,0,1)));",
++        // Parallel Exchange Center Halfword: halfwords 1<->2 in each 64-bit half (PS2_PEXCH)
++        return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PEXCH(GPR_VEC(ctx, {})));",
+                            inst.rd, inst.rt);
+     }
+ 
+@@ -577,8 +576,8 @@ namespace ps2recomp
+ 
+     std::string CodeGenerator::translatePEXCW(const Instruction &inst)
+     {
+-        // Parallel Exchange Center Word (Swaps words 0<>2, 1<>3)
+-        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shuffle_epi32(GPR_VEC(ctx, {}), _MM_SHUFFLE(1,0,3,2)));",
++        // Parallel Exchange Center Word: words 1<->2 (PS2_PEXCW)
++        return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PEXCW(GPR_VEC(ctx, {})));",
+                            inst.rd, inst.rt);
+     }
+ 
+diff --git a/ps2xRuntime/include/ps2_runtime_macros.h b/ps2xRuntime/include/ps2_runtime_macros.h
+index 2808b0e..afd0a68 100644
+--- a/ps2xRuntime/include/ps2_runtime_macros.h
++++ b/ps2xRuntime/include/ps2_runtime_macros.h
+@@ -797,8 +797,10 @@ inline __m128i ps2_ppacb(__m128i rs, __m128i rt)
+ #define PS2_PPACB(a, b) ps2_ppacb((__m128i)(a), (__m128i)(b))
+ 
+ // Packed Interleave (PINT)
+-#define PS2_PINTH(a, b) _mm_unpacklo_epi16(_mm_shuffle_epi32((__m128i)(b), _MM_SHUFFLE(3, 2, 1, 0)), _mm_shuffle_epi32((__m128i)(a), _MM_SHUFFLE(3, 2, 1, 0)))
+-#define PS2_PINTEH(a, b) _mm_unpackhi_epi16(_mm_shuffle_epi32((__m128i)(b), _MM_SHUFFLE(3, 2, 1, 0)), _mm_shuffle_epi32((__m128i)(a), _MM_SHUFFLE(3, 2, 1, 0)))
++// PINTH rd, rs, rt: rt.h0, rs.h4, rt.h1, rs.h5, ... (lower half of rt with upper half of rs).
++// PINTEH rd, rs, rt: rt.h0, rs.h0, rt.h2, rs.h2, ... (even halfwords of both).
++#define PS2_PINTH(a, b) _mm_unpacklo_epi16((__m128i)(b), _mm_unpackhi_epi64((__m128i)(a), (__m128i)(a)))
++#define PS2_PINTEH(a, b) _mm_or_si128(_mm_and_si128((__m128i)(b), _mm_set1_epi32(0xFFFF)), _mm_slli_epi32((__m128i)(a), 16))
+ 
+ // Packed Multiply-Add (PMADD)
+ #define PS2_PMADDW(a, b) _mm_add_epi32(_mm_mullo_epi32(_mm_shuffle_epi32((__m128i)(a), _MM_SHUFFLE(1, 0, 3, 2)), _mm_shuffle_epi32((__m128i)(b), _MM_SHUFFLE(1, 0, 3, 2))), _mm_mullo_epi32(_mm_shuffle_epi32((__m128i)(a), _MM_SHUFFLE(3, 2, 1, 0)), _mm_shuffle_epi32((__m128i)(b), _MM_SHUFFLE(3, 2, 1, 0))))
+@@ -986,9 +988,16 @@ inline __m128i ps2_qfsrv(__m128i rs, __m128i rt, uint32_t sa)
+ }
+ #define PS2_QFSRV(rs, rt, sa) ps2_qfsrv((__m128i)(rs), (__m128i)(rt), (uint32_t)(sa))
+ #define PS2_PCPYLD(rs, rt) _mm_unpacklo_epi64(rt, rs)
+-#define PS2_PEXEH(rs) _mm_shufflelo_epi16(_mm_shufflehi_epi16(rs, _MM_SHUFFLE(2, 3, 0, 1)), _MM_SHUFFLE(2, 3, 0, 1))
+-#define PS2_PEXEW(rs) _mm_shuffle_epi32(rs, _MM_SHUFFLE(2, 3, 0, 1))
+-#define PS2_PROT3W(rs) _mm_shuffle_epi32(rs, _MM_SHUFFLE(0, 3, 2, 1))
++// Word/halfword permutations of the R5900 (EE Core Instruction Set Manual; same as PCSX2). _MM_SHUFFLE(d, c, b, a)
++// puts source lanes a, b, c, d in lanes 0, 1, 2, 3. The halfword forms work on each 64-bit half separately.
++//   PEXEH: h0<->h2      PEXCH: h1<->h2      PREVH: h0..h3 reversed
++//   PEXEW: w0<->w2      PEXCW: w1<->w2      PROT3W: w0..w2 rotated (w0 = w1, w1 = w2, w2 = w0), w3 kept
++#define PS2_PEXEH(rs) _mm_shufflelo_epi16(_mm_shufflehi_epi16(rs, _MM_SHUFFLE(3, 0, 1, 2)), _MM_SHUFFLE(3, 0, 1, 2))
++#define PS2_PEXCH(rs) _mm_shufflelo_epi16(_mm_shufflehi_epi16(rs, _MM_SHUFFLE(3, 1, 2, 0)), _MM_SHUFFLE(3, 1, 2, 0))
++#define PS2_PREVH(rs) _mm_shufflelo_epi16(_mm_shufflehi_epi16(rs, _MM_SHUFFLE(0, 1, 2, 3)), _MM_SHUFFLE(0, 1, 2, 3))
++#define PS2_PEXEW(rs) _mm_shuffle_epi32(rs, _MM_SHUFFLE(3, 0, 1, 2))
++#define PS2_PEXCW(rs) _mm_shuffle_epi32(rs, _MM_SHUFFLE(3, 1, 2, 0))
++#define PS2_PROT3W(rs) _mm_shuffle_epi32(rs, _MM_SHUFFLE(3, 0, 2, 1))
+ 
+ // Additional VU0 operations
+ #define PS2_VSQRT(x) sqrtf(x)

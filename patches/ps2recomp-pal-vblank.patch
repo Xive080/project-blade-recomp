@@ -1,0 +1,197 @@
+diff --git a/ps2xIOP/include/ps2x/iop/iop_subsystem.h b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+index 68fec81..a38f5cf 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_subsystem.h
++++ b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+@@ -10,6 +10,10 @@
+ 
+ namespace ps2x::iop
+ {
++    // Ritmo del VBlank del IOP (WaitVblankStart/End de vblank.irx): PAL 50 Hz, NTSC 59,94 Hz (por defecto).
++    // Lo fija el EE al elegir el modo de video (SetGsCrt).
++    void setPalVideo(bool pal) noexcept;
++
+     class IopSubsystem
+     {
+     public:
+diff --git a/ps2xIOP/src/emulator/imports/iop_vblank.cpp b/ps2xIOP/src/emulator/imports/iop_vblank.cpp
+index c3bcf33..ea6a006 100644
+--- a/ps2xIOP/src/emulator/imports/iop_vblank.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_vblank.cpp
+@@ -3,6 +3,22 @@
+ #include "../core/iop_cpu.h"
+ #include "../iop_emulator_const.h"
+ #include "../core/iop_kernel.h"
++#include "ps2x/iop/iop_subsystem.h"
++
++#include <atomic>
++
++namespace
++{
++    std::atomic<uint64_t> g_vblankPeriodCycles{kVblankPeriodCycles};
++}
++
++namespace ps2x::iop
++{
++    void setPalVideo(bool pal) noexcept
++    {
++        g_vblankPeriodCycles.store(pal ? kIopClockHz / 50ull : kVblankPeriodCycles, std::memory_order_relaxed);
++    }
++}
+ 
+ namespace ps2x::iop::detail
+ {
+@@ -21,11 +37,12 @@ namespace ps2x::iop::detail
+         case 7: // WaitNonVblank
+         {
+             const bool waitForEnd = ordinal == 5u || ordinal == 7u;
+-            const uint64_t phase = waitForEnd ? kVblankEndPhaseCycles : 0u;
+-            const uint64_t fieldStart = currentCycle - (currentCycle % kVblankPeriodCycles);
++            const uint64_t period = g_vblankPeriodCycles.load(std::memory_order_relaxed);
++            const uint64_t phase = waitForEnd ? (period / 16ull) : 0u;
++            const uint64_t fieldStart = currentCycle - (currentCycle % period);
+             uint64_t wakeCycle = fieldStart + phase;
+             if (wakeCycle <= currentCycle)
+-                wakeCycle += kVblankPeriodCycles;
++                wakeCycle += period;
+             m_kernel.delayCurrentUntil(wakeCycle, cpu);
+             cpu.gpr[2] = 0u;
+             return true;
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index f247ff9..62bb72c 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -281,6 +281,9 @@ public:
+     [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
+     void accountCycles(uint32_t cycles) noexcept;
+     [[nodiscard]] bool isExecutingGuest() const noexcept;
++    // Modo de video elegido por el juego (SetGsCrt / sceGsResetGraph: 2 = NTSC, 3 = PAL). Fija el periodo del VBlank
++    // del EE (16 667 us en NTSC, 20 000 us en PAL, desde el siguiente VBlank) y el del IOP; los demas modos no cambian.
++    void setVideoMode(int videoMode) noexcept;
+ 
+     // Kernel object API. All calls except postEvent/requestStop execute on the
+     // EE executor and therefore need no host synchronization.
+@@ -442,6 +445,8 @@ private:
+     uint64_t m_eventSequence = 0;
+     uint64_t m_invocationSequence = 0;
+     uint64_t m_vsyncTick = 0;
++    uint64_t m_vblankPeriodCycles = 0;
++    std::chrono::microseconds m_vblankPeriod{16667};
+     uint32_t m_vsyncFlagAddress = 0;
+     uint32_t m_vsyncTickAddress = 0;
+     uint32_t m_gsVSyncCallback = 0;
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index f05d0b6..fd45f0a 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1,4 +1,5 @@
+ #include "runtime/ee_scheduler.h"
++#include "ps2x/iop/iop_subsystem.h"
+ 
+ #include "ps2_log.h"
+ #include "ps2_runtime_macros.h"
+@@ -6,6 +7,7 @@
+ #include <algorithm>
+ #include <cassert>
+ #include <cstring>
++#include <iostream>
+ #include <limits>
+ #include <stdexcept>
+ 
+@@ -31,7 +33,7 @@ namespace
+     constexpr uint32_t WEF_OR = 0x01u;
+     constexpr uint32_t WEF_CLEAR = 0x10u;
+     constexpr uint32_t WEF_CLEAR_ALL = 0x20u;
+-    constexpr auto kVBlankPeriod = std::chrono::microseconds(16667);
++    constexpr auto kVBlankPeriod = std::chrono::microseconds(16667); // NTSC por defecto (SetGsCrt lo cambia)
+     constexpr auto kVBlankDuration = std::chrono::microseconds(500);
+     constexpr uint64_t kAlarmTickMicroseconds = 64u;
+     constexpr uint32_t kDebugPublishDispatchInterval = 4096u;
+@@ -146,8 +148,13 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+     main.status = EeThreadStatus::Ready;
+     m_threads.emplace(main.id, std::move(main));
+     m_readyQueues[0].push_back(kMainThreadId);
+-    scheduleEvent(m_eeCycle + kVBlankPeriodCycles,
+-                  std::chrono::steady_clock::now() + kVBlankPeriod,
++    if (m_vblankPeriodCycles == 0u)
++    {
++        m_vblankPeriodCycles = kVBlankPeriodCycles;
++        m_vblankPeriod = kVBlankPeriod;
++    }
++    scheduleEvent(m_eeCycle + m_vblankPeriodCycles,
++                  std::chrono::steady_clock::now() + m_vblankPeriod,
+                   EeEvent{EeEventType::VBlankStart, 0, 0});
+     publishSnapshot();
+ }
+@@ -400,6 +407,23 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+     }
+ }
+ 
++void EeScheduler::setVideoMode(int videoMode) noexcept
++{
++    if (videoMode != 2 && videoMode != 3)
++    {
++        return;
++    }
++    const bool pal = videoMode == 3;
++    const uint32_t microseconds = pal ? 20000u : 16667u;
++    if (m_vblankPeriod.count() != microseconds)
++    {
++        std::cout << "[ee] modo de video " << (pal ? "PAL: VBlank a 50 Hz" : "NTSC: VBlank a 60 Hz") << std::endl;
++    }
++    m_vblankPeriodCycles = microsecondsToEeCycles(microseconds);
++    m_vblankPeriod = std::chrono::microseconds(microseconds);
++    ps2x::iop::setPalVideo(pal);
++}
++
+ bool EeScheduler::isExecutingGuest() const noexcept
+ {
+     return m_guestExecuting.load(std::memory_order_acquire);
+@@ -1850,8 +1874,8 @@ void EeScheduler::processDueDeadlines()
+                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
+                               scheduled.hostDeadline + kVBlankDuration,
+                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
+-                scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
+-                              scheduled.hostDeadline + kVBlankPeriod,
++                scheduleEvent(scheduled.deadlineCycle + m_vblankPeriodCycles,
++                              scheduled.hostDeadline + m_vblankPeriod,
+                               EeEvent{EeEventType::VBlankStart, 0, 0});
+             }
+             processEvent(scheduled.event);
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+index aed4cb5..4727cb2 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+@@ -800,6 +800,10 @@ namespace ps2_stubs
+ 
+             g_gparam.interlace = static_cast<uint8_t>(interlace & 0x1);
+             g_gparam.omode = static_cast<uint8_t>(omode & 0xFF);
++            if (runtime)
++            {
++                runtime->eeScheduler().setVideoMode(static_cast<int>(omode)); // PAL 50 Hz / NTSC 60 Hz
++            }
+             g_gparam.ffmode = static_cast<uint8_t>(ffmode & 0x1);
+             writeGsGParamToScratch(runtime);
+             uint64_t pmode = makePmode(1, 0, 0, 0, 0, 0x80);
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+index 9614016..b985557 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -6,7 +6,7 @@ namespace ps2_syscalls
+     void GsSetCrt(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         int interlaced = getRegU32(ctx, 4); // $a0 - 0=non-interlaced, 1=interlaced
+-        int videoMode = getRegU32(ctx, 5);  // $a1 - 0=NTSC, 1=PAL, 2=VESA, 3=HiVision
++        int videoMode = getRegU32(ctx, 5);  // $a1 - 2=NTSC, 3=PAL (BIOS), 0x1A..=VESA, 0x50..=DTV
+         int frameMode = getRegU32(ctx, 6);  // $a2 - 0=field, 1=frame
+ 
+         if (runtime)
+@@ -18,6 +18,9 @@ namespace ps2_syscalls
+ 
+             gs.smode2 = smode2;
+ 
++            // Ritmo de VBlank del EE y del IOP: PAL 50 Hz, NTSC 60 Hz (los demas modos se dejan como estan)
++            runtime->eeScheduler().setVideoMode(videoMode);
++
+             // Keep CRT1 enabled after the BIOS syscall selects a display mode.
+             if ((gs.pmode & 0x3ull) == 0ull)
+             {

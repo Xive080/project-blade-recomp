@@ -1,0 +1,70 @@
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -5,12 +5,23 @@
+ #include "ps2_runtime_macros.h"
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <cassert>
+ #include <cstring>
+ #include <iostream>
+ #include <limits>
+ #include <stdexcept>
+ 
++// ---- Modo determinista (PS2X_DETERMINISTIC=1) y gancho por VSync; sin la variable no cambia nada ----
++// Sin ritmo de reloj de pared: los plazos se cumplen por ciclos del EE y no por el reloj del anfitrion. El gancho se llama
++// en el hilo del EE al empezar cada VBlank, a un ciclo que depende solo de la ejecucion del invitado.
++void (*ps2xQaVSyncHook)(PS2Runtime &, uint64_t) = nullptr;
++static const bool g_qaDeterministic = []()
++{
++    const char *e = std::getenv("PS2X_DETERMINISTIC");
++    return e && *e && *e != '0';
++}();
++
+ namespace
+ {
+     constexpr int KE_OK = 0;
+@@ -1822,7 +1833,7 @@
+                 return;
+             }
+ 
+-            if (now < pacingDeadline)
++            if (!g_qaDeterministic && now < pacingDeadline)
+             {
+                 m_eventCv.wait_until(lock, pacingDeadline, [this]()
+                                      { return !m_events.empty() ||
+@@ -1838,7 +1849,7 @@
+             auto firstFuture = std::partition(m_deadlines.begin(), m_deadlines.end(),
+                                               [this, pacedNow](const ScheduledEvent &item)
+                                               { return item.deadlineCycle <= m_eeCycle &&
+-                                                       item.hostDeadline <= pacedNow; });
++                                                       (g_qaDeterministic || item.hostDeadline <= pacedNow); });
+             due.insert(due.end(),
+                        std::make_move_iterator(m_deadlines.begin()),
+                        std::make_move_iterator(firstFuture));
+@@ -1893,6 +1904,10 @@
+     case EeEventType::VBlankStart:
+         ++m_vsyncTick;
+         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
++        if (ps2xQaVSyncHook)
++        {
++            ps2xQaVSyncHook(m_runtime, m_vsyncTick);
++        }
+         if ((m_vsyncTick & 1u) != 0u)
+         {
+             m_runtime.memory().gs().csr.fetch_or(0x2000ull, std::memory_order_acq_rel);
+@@ -2083,9 +2098,11 @@
+     }
+     lock.lock();
+ 
+-    const bool signaled = m_eventCv.wait_until(lock, hostDeadline, [this]()
+-                                               { return !m_events.empty() ||
+-                                                        m_stopRequested.load(std::memory_order_acquire); });
++    const bool signaled = g_qaDeterministic
++                              ? (!m_events.empty() || m_stopRequested.load(std::memory_order_acquire))
++                              : m_eventCv.wait_until(lock, hostDeadline, [this]()
++                                                     { return !m_events.empty() ||
++                                                              m_stopRequested.load(std::memory_order_acquire); });
+     if (!signaled)
+     {
+         const uint64_t elapsed = deadlineCycle > m_eeCycle ? deadlineCycle - m_eeCycle : 0u;

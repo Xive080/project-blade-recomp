@@ -1,0 +1,150 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 93b63a4..0b85381 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -12,9 +12,92 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <filesystem>
++#include <bitset>
++#include <chrono>
+ #include <limits>
++#include <map>
++#include <utility>
+ #include <ps2_log.h>
+ 
++namespace
++{
++    // Perfil de microprogramas del VU1 (PS2X_VU1_PROFILE=1): por (direccion de arranque, hash de los 16 KB
++    // de microcodigo) cuenta llamadas, ciclos, tiempo real y pares distintos ejecutados; lo escribe al salir.
++    struct Vu1ProfEntry
++    {
++        uint64_t calls = 0, resumes = 0, cycles = 0, ns = 0;
++        std::bitset<2048> visited;
++    };
++    struct Vu1Prof
++    {
++        bool on = false;
++        std::map<std::pair<uint32_t, uint64_t>, Vu1ProfEntry> entries;
++        std::bitset<2048> current;
++        Vu1Prof() { const char *e = std::getenv("PS2X_VU1_PROFILE"); on = e && *e && *e != '0'; }
++        uint64_t sinceDump = 0;
++        std::chrono::steady_clock::time_point lastDump = std::chrono::steady_clock::now();
++        // Informe acumulado cada 30 s reales (el proceso sale sin destructores): la diferencia entre dos
++        // informes seguidos da la distribucion de ese tramo.
++        void maybeDump()
++        {
++            if ((++sinceDump & 1023u) != 0u)
++                return;
++            const auto now = std::chrono::steady_clock::now();
++            if (now - lastDump < std::chrono::seconds(30))
++                return;
++            lastDump = now;
++            dump();
++        }
++        ~Vu1Prof() { dump(); }
++        void dump()
++        {
++            if (!on)
++                return;
++            std::printf("[vu1prof] ===== informe\n");
++            uint64_t totalCycles = 0, totalNs = 0;
++            for (const auto &kv : entries) { totalCycles += kv.second.cycles; totalNs += kv.second.ns; }
++            std::printf("[vu1prof] %zu (arranque, imagen) distintos, %llu ciclos, %.2f s\n", entries.size(),
++                        (unsigned long long)totalCycles, totalNs / 1e9);
++            std::map<uint32_t, std::pair<uint64_t, std::bitset<2048>>> byStart;
++            for (const auto &kv : entries)
++            {
++                auto &b = byStart[kv.first.first];
++                b.first += kv.second.cycles;
++                b.second |= kv.second.visited;
++            }
++            std::printf("[vu1prof] %zu direcciones de arranque distintas\n", byStart.size());
++            for (const auto &kv : entries)
++                std::printf("[vu1prof] pc=0x%03x img=%016llx llamadas=%llu reanudaciones=%llu ciclos=%llu (%.1f%%) tiempo=%.3fs pares=%zu\n",
++                            kv.first.first, (unsigned long long)kv.first.second, (unsigned long long)kv.second.calls,
++                            (unsigned long long)kv.second.resumes, (unsigned long long)kv.second.cycles,
++                            100.0 * kv.second.cycles / std::max<uint64_t>(1, totalCycles), kv.second.ns / 1e9,
++                            kv.second.visited.count());
++            for (const auto &kv : byStart)
++                std::printf("[vu1prof] arranque 0x%03x: %llu ciclos (%.1f%%), %zu pares distintos\n", kv.first,
++                            (unsigned long long)kv.second.first, 100.0 * kv.second.first / std::max<uint64_t>(1, totalCycles),
++                            kv.second.second.count());
++            std::fflush(stdout);
++        }
++    };
++    Vu1Prof g_vu1Prof;
++
++    uint64_t vu1ProfHash(const uint8_t *code, uint32_t size, uint64_t generation)
++    {
++        static uint64_t cachedGeneration = ~0ull, cachedHash = 0;
++        if (generation == cachedGeneration)
++            return cachedHash;
++        cachedGeneration = generation;
++        uint64_t h = 1469598103934665603ull;
++        for (uint32_t i = 0; i + 8u <= size; i += 8u)
++        {
++            uint64_t w;
++            std::memcpy(&w, code + i, 8);
++            h = (h ^ w) * 1099511628211ull;
++        }
++        return cachedHash = h;
++    }
++}
++
+ namespace
+ {
+     constexpr uint8_t laneForComponent(uint32_t component)
+@@ -1627,6 +1710,21 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
+     m_state.vf[0][1] = 0.0f;
+     m_state.vf[0][2] = 0.0f;
+     m_state.vf[0][3] = 1.0f;
++    if (g_vu1Prof.on && m_unit == Unit::VU1)
++    {
++        const uint64_t c0 = m_cycle;
++        const auto t0 = std::chrono::steady_clock::now();
++        g_vu1Prof.current.reset();
++        const uint32_t start = m_state.pc;
++        run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
++        Vu1ProfEntry &e = g_vu1Prof.entries[{start, vu1ProfHash(vuCode, codeSize, memory ? memory->getVU1CodeGeneration() : 0u)}];
++        ++e.calls;
++        e.cycles += m_cycle - c0;
++        e.ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
++        e.visited |= g_vu1Prof.current;
++        g_vu1Prof.maybeDump();
++        return;
++    }
+     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
+ }
+ 
+@@ -1639,6 +1737,21 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
+     m_state.itop = itop;
+     m_state.stoppedByD = false;
+     m_state.stoppedByT = false;
++    if (g_vu1Prof.on && m_unit == Unit::VU1)
++    {
++        const uint64_t c0 = m_cycle;
++        const auto t0 = std::chrono::steady_clock::now();
++        g_vu1Prof.current.reset();
++        const uint32_t start = m_state.pc;
++        run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
++        Vu1ProfEntry &e = g_vu1Prof.entries[{start, vu1ProfHash(vuCode, codeSize, memory ? memory->getVU1CodeGeneration() : 0u)}];
++        ++e.resumes;
++        e.cycles += m_cycle - c0;
++        e.ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
++        e.visited |= g_vu1Prof.current;
++        g_vu1Prof.maybeDump();
++        return;
++    }
+     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
+ }
+ 
+@@ -1663,6 +1776,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         if (m_state.pc + 8u > codeSize)
+             break;
+ 
++        if (g_vu1Prof.on && m_unit == Unit::VU1)
++            g_vu1Prof.current.set((m_state.pc >> 3) & 2047u);
+         const DecodedInstructionPair &decoded = getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
+         if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
+         {

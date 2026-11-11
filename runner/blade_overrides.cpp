@@ -23,16 +23,62 @@ namespace
     uint32_t readGuest32(const uint8_t *rdram, uint32_t address);
     PS2Runtime::RecompiledFunction gRtAtomicRender = nullptr;
     unsigned long long gRtFrom = 0, gRtTo = 0;
+    uint32_t gRtSkipAtomic = 0;
     // BLADE_RT_FUNCS=0xDIR,0xDIR...: ademas, registra entrada (a0-a3, ra) de esas funciones durante la ventana de BLADE_RT_TRACE.
     PS2Runtime::RecompiledFunction gRtOrig[8] = {};
     uint32_t gRtAddr[8] = {};
     template <int N>
     void ovTraceGeneric(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        if (gRtTo && gBladeQaTick >= gRtFrom && gBladeQaTick <= gRtTo)
-            std::printf("[rtf] tick %llu fn=%08x a0=%08x a1=%08x a2=%08x a3=%08x ra=%08x\n", gBladeQaTick, gRtAddr[N], GPR_U32(ctx, 4),
-                        GPR_U32(ctx, 5), GPR_U32(ctx, 6), GPR_U32(ctx, 7), GPR_U32(ctx, 31));
+        if (gRtTo && gBladeQaTick >= gRtFrom && gBladeQaTick <= gRtTo && gRtAddr[N] != 0x179CF0u)
+        {
+            uint32_t stamp = 0;
+            if (const uint8_t *spr = ps2GetScratchpadHostPtr())
+                std::memcpy(&stamp, spr + 0x3FB8u, 4);
+            std::printf("[rtf] tick %llu fn=%08x a0=%08x a1=%08x a2=%08x a3=%08x ra=%08x stamp=%08x\n", gBladeQaTick, gRtAddr[N],
+                        GPR_U32(ctx, 4), GPR_U32(ctx, 5), GPR_U32(ctx, 6), GPR_U32(ctx, 7), GPR_U32(ctx, 31), stamp);
+        }
+        const bool traceWin = gRtTo && gBladeQaTick >= gRtFrom && gBladeQaTick <= gRtTo;
+        const uint32_t a0 = GPR_U32(ctx, 4);
+        const uint32_t a3 = GPR_U32(ctx, 7);
+        if (traceWin && gRtAddr[N] == 0x128910u && a0 == 0x0104F224u)
+        {
+            uint32_t sp[12] = {};
+            if (const uint8_t *spr = ps2GetScratchpadHostPtr())
+                std::memcpy(sp, spr + 0x10, sizeof(sp));
+            std::printf("[rtl] tick %llu spr10:", gBladeQaTick);
+            for (uint32_t v : sp) { float f; std::memcpy(&f, &v, 4); std::printf(" %08x(%g)", v, f); }
+            std::printf("\n");
+            int guard = 0;
+            for (uint32_t n = readGuest32(rdram, a0 + 0xCu); n && guard < 64; n = readGuest32(rdram, n + 8u), ++guard)
+            {
+                const uint32_t o = readGuest32(rdram, n + 4u), vt = readGuest32(rdram, o + 0xCu);
+                std::printf("[rtl] tick %llu node=%08x obj=%08x vt=%08x m7=%08x +10=%08x +48=%08x +cc=%08x\n", gBladeQaTick, n, o, vt,
+                            readGuest32(rdram, vt + 0x1Cu), readGuest32(rdram, o + 0x10u), readGuest32(rdram, o + 0x48u),
+                            readGuest32(rdram, o + 0xCCu));
+            }
+        }
+        const uint32_t ra = GPR_U32(ctx, 31), s2 = GPR_U32(ctx, 18), s5 = GPR_U32(ctx, 21);
+        const bool distCall = traceWin && gRtAddr[N] == 0x179CF0u && (ra == 0x128C78u || ra == 0x128C8Cu) &&
+                              (s2 == 0xBF5350u || s5 == 0x0104F224u);
         gRtOrig[N](rdram, ctx, runtime);
+        if (distCall)
+        {
+            uint32_t f0b, f20b, f21b;
+            std::memcpy(&f0b, &ctx->f[0], 4); std::memcpy(&f20b, &ctx->f[20], 4); std::memcpy(&f21b, &ctx->f[21], 4);
+            std::printf("[rtd] tick %llu obj=%08x cell=%08x a0=%08x f0=%08x(%g) f20=%08x(%g) f21=%08x(%g) s3=%u s4=%u fcr31=%08x\n",
+                        gBladeQaTick, s2, s5, a0, f0b, ctx->f[0], f20b, ctx->f[20], f21b, ctx->f[21], GPR_U32(ctx, 19),
+                        GPR_U32(ctx, 20), ctx->fcr31);
+        }
+        if (traceWin && gRtAddr[N] == 0x128910u && a0 == 0x0104F224u)
+        {
+            float sp[14] = {};
+            if (const uint8_t *spr = ps2GetScratchpadHostPtr())
+                std::memcpy(sp, spr + 0x10, sizeof(sp));
+            std::printf("[rtp] tick %llu a3=%u player+48=%08x +10=%08x flagsw=%08x sp10=%g 14=%g 18=%g 1c=%g 20=%g 24=%g 28=%g 2c=%g 30=%g 34=%g\n",
+                        gBladeQaTick, a3, readGuest32(rdram, 0xBF5350u + 0x48u), readGuest32(rdram, 0xBF5350u + 0x10u),
+                        readGuest32(rdram, 0x30A368u), sp[0], sp[1], sp[2], sp[3], sp[4], sp[5], sp[6], sp[7], sp[8], sp[9]);
+        }
     }
     void ovTraceAtomicRender(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
@@ -47,6 +93,13 @@ namespace
             b = readGuest32(rdram, fr + 0x88u); std::memcpy(&pz, &b, 4);
             std::printf("[rt] tick %llu atomic=%08x flags=%08x geom=%08x pipe=%08x pos=%.2f,%.2f,%.2f ra=%08x\n", gBladeQaTick, a,
                         readGuest32(rdram, a), readGuest32(rdram, a + 0x18u), pipe, px, py, pz, GPR_U32(ctx, 31));
+        }
+        if (gRtSkipAtomic && a == gRtSkipAtomic)
+        {
+            // BLADE_RT_SKIP=0xATOMICO: no dibuja ese atomico (para saber que pinta cada uno)
+            SET_GPR_U32(ctx, 2, a);
+            ctx->pc = GPR_U32(ctx, 31);
+            return;
         }
         gRtAtomicRender(rdram, ctx, runtime);
     }
@@ -223,6 +276,8 @@ namespace
             const char *c = std::strchr(t, ',');
             gRtTo = c ? std::strtoull(c + 1, nullptr, 10) : gRtFrom;
             gRtAtomicRender = runtime.lookupFunction(0x00200740u);
+            if (const char *sk = std::getenv("BLADE_RT_SKIP"); sk && *sk)
+                gRtSkipAtomic = static_cast<uint32_t>(std::strtoul(sk, nullptr, 16));
             if (gRtAtomicRender)
                 runtime.replaceFunction(0x00200740u, ovTraceAtomicRender);
             if (const char *fl = std::getenv("BLADE_RT_FUNCS"); fl && *fl)

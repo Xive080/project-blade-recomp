@@ -141,6 +141,11 @@ Propios:
   `PS2X_DETERMINISTIC=1`; sin la variable no cambia nada. Sin ritmo de reloj de pared (los plazos se cumplen por ciclos
   del EE) y con un gancho `ps2xQaVSyncHook` que se llama en el hilo del EE al empezar cada VBlank. Se aplica despues de
   `ee-idle-iop` y `pal-vblank` y antes de `z-spu2-mixer`. Lo usa `runner/qa_deterministic.cpp`.
+- `ps2recomp-z-fpu-compare.patch`: `C.EQ.S`/`C.LT.S`/`C.LE.S` se traducian a la comparacion del host. En la PS2 no hay
+  NaN ni Inf: el exponente 255 es un numero muy grande (un desbordamiento deja 0x7FFFFFFF) y toda comparacion esta
+  ordenada; el host lee ese patron como NaN y responde falso a todo. Ahora, si algun operando tiene exponente 255, se
+  compara con `ps2_to_double` (el mismo modelo que ya usan ADD/SUB/MUL/DIV); el resto sigue con la comparacion del host.
+  Se aplica despues de `z-deterministic` (ultimo que toca `ps2_runtime_macros.h`). Ver "Pendiente 4" (AB-004).
 - `ps2recomp-z-gs-fastpath.patch` (rasterizador por CPU; se aplica despues de los demas parches del GS): rutas rapidas de
   muestreo de textura y de `WritePixel` por primitiva y reparto por bandas; ver "GS: rutas rapidas". Variables:
   `PS2X_GS_AB=1` (compara cada tramo con la ruta antigua en serie y aborta si la VRAM difiere), `PS2X_GS_LEGACY=1` (fuerza
@@ -438,7 +443,7 @@ Detalle y evidencia en `docs/` (`QA_REPORT.md`, `AIRBLADE_STATUS.md`, `AIRBLADE_
   `rgba=255,255,255,128` con `ALPHA=0x48` (Cs*As + Cd, aditivo): el blanco saturado es lo que pide el juego. En la
   escena de entrada del nivel 1 un edificio sale como silueta negra (geometria del VU1). El mundo negro de la partida era
   la matriz de camara nula (Pendiente 1, resuelto en la FPU/VU0), no el GS.
-- Pendiente 4 (jugador invisible; el personaje ya se dibuja, sin tabla ni sombra visibles, sin comparar con PCSX2 - AB-004 en `docs/AIRBLADE_ISSUES.md`): en la partida no se veian el personaje ni la tabla. La camara estaba bien
+- Pendiente 4 (jugador invisible; desde `ps2recomp-z-fpu-compare.patch` el jugador y la tabla se dibujan, queda una mancha blanca en el suelo - AB-004 en `docs/AIRBLADE_ISSUES.md`): en la partida no se veian el personaje ni la tabla. La camara estaba bien
   (controlador en 0x1EC9E68: camara en +0xE4, objetivo en +0x34/+0xA0, a 3,2 unidades por detras y a la altura de la
   cabeza; el jugador, raiz del esqueleto en 0xC04770, en y = 6, y los planos del frustum lo dejan dentro), los huesos
   tenian matrices ortonormales y el atomico (0xC07DE0, pipeline 0x1ECCF00) se dibujaba: una traza del GS mostraba
@@ -460,6 +465,23 @@ Detalle y evidencia en `docs/` (`QA_REPORT.md`, `AIRBLADE_STATUS.md`, `AIRBLADE_
   (el metodo de dibujo del jugador, vtable 0x2FECE0 [7] = 0x13CD40 -> 0x149E60 -> vtable 0x303E20 [7] = 0x14CF90, que
   encola con 0x12E8D0, no se llama o sale antes; el A = 0 visto antes era otro efecto). Sin resolver (la maquina perdio la
   sesion grafica y no se pudieron hacer mas corridas).
+  Causa (2026-11-11, FIXED-BUILT, UNVERIFIED sin captura de PCSX2 en el mismo tick): el recorrido de dibujo por celdas
+  (0x128910) si llega al jugador (celda 0x104F224 = (11,13), primer nodo 0xC53E00; pasa el sello, el metodo y los flags),
+  pero lo descarta en la prueba de distancia: pide la distancia de dibujo de su clase a 0x179CF0 (tabla en 0x2E02F0 =
+  60, 90, 120, FLT_MAX; el jugador usa la entrada 0xC = FLT_MAX = "siempre"), la eleva al cuadrado (`mul.s`) y compara
+  `c.lt.s f20, f0` con f20 = distancia^2 de la camara a la celda (38,8 en el tick 3100). FLT_MAX^2 desborda: la PS2 deja
+  0x7FFFFFFF (el mayor numero), que para el host es un NaN, y `38,8 < NaN` es falso, asi que [sp+0x9C] quedaba a 0 y no
+  se llamaba al metodo [7]. Traza (`[rtl]`/`[rtd]` de `BLADE_RT_FUNCS=0x128910,0x179CF0,0x13CD40,0x14CF90`): antes,
+  ninguna llamada a 0x13CD40; despues, `fn=0013cd40 a0=00bf5350 ra=00128d84` y `fn=0014cf90` en cada tick, y 0x200740
+  recibe los 4 atomicos del jugador (0xC07DE0 cuerpo, 0xC0C1E0, 0xC0C0C0 y 0xC53560 = la tabla, comprobado con
+  `BLADE_RT_SKIP=0xC53560`). Arreglo: `ps2recomp-z-fpu-compare.patch`. Capturas (mismo guion, ticks 3100 y 3160):
+  `qa_out/ab004/antes/frame_003100.png` y `frame_003160.png` (sin jugador) frente a `qa_out/ab004/despues/` (jugador
+  sobre la tabla, en primer plano). Regresion (`scripts/qa_regression.sh`, referencia `qa/ref_det` del clon de QA):
+  hashes de RAM y de imagen iguales hasta el tick 1700 (menus; hitos 650/900/1100 IGUAL) y distintos del 1750 al 3950
+  (45 de 78 puntos; hitos 3000/3900 DIFERENTE): la referencia hay que regenerarla. NUEVO, abierto: desde que el jugador
+  se dibuja aparece una mancha blanca opaca en el suelo alrededor de el (ticks 2300, 3000, 3100, 3160, 3900); no sale de
+  los atomicos que pasan por 0x200740 (sigue al quitar la tabla); hipotesis sin comprobar: la sombra proyectada del
+  jugador, con textura o mezcla mal. Tambien sin comprobar: `MAX.S`/`MIN.S` y las comparaciones del VU con exponente 255.
 - Pendiente 3: rendimiento (2026-11-11, `BLADE_STATS=1`, Mac M1 de 8 nucleos; medidas con otros procesos pesados
   compitiendo, orientativas). Menu a 50 VSync/s fijos (a ritmo real, PAL); partida del nivel 1 entre 14 y 22 VSync/s
   (antes 16 VSync/s a 60 Hz). Ya no hay espera activa: en la partida el hilo del EE esta ~100 % ocupado, ~75 % en el

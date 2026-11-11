@@ -1,0 +1,50 @@
+diff --git a/ps2xRuntime/include/ps2_runtime_macros.h b/ps2xRuntime/include/ps2_runtime_macros.h
+index 3a7f641..8da940c 100644
+--- a/ps2xRuntime/include/ps2_runtime_macros.h
++++ b/ps2xRuntime/include/ps2_runtime_macros.h
+@@ -178,6 +178,30 @@ inline double ps2_to_double(float x)
+     return static_cast<double>(x);
+ }
+ 
++// C.EQ.S/C.LT.S/C.LE.S. The PS2 has no NaN or Inf: exponent 255 is just a very large number (0x7FFFFFFF is what an
++// overflow leaves, e.g. FLT_MAX * FLT_MAX), so every comparison is ordered. The host would read those patterns as
++// NaN/Inf and answer false to all of them. Operands without exponent 255 keep the host comparison.
++inline bool ps2_fcmp_wide(float a, float b)
++{
++    return ((std::bit_cast<uint32_t>(a) & PS2_FLOAT_EXP_MASK) == PS2_FLOAT_EXP_MASK) |
++           ((std::bit_cast<uint32_t>(b) & PS2_FLOAT_EXP_MASK) == PS2_FLOAT_EXP_MASK);
++}
++
++inline bool ps2_fcmp_eq(float a, float b)
++{
++    return ps2_fcmp_wide(a, b) ? ps2_to_double(a) == ps2_to_double(b) : a == b;
++}
++
++inline bool ps2_fcmp_lt(float a, float b)
++{
++    return ps2_fcmp_wide(a, b) ? ps2_to_double(a) < ps2_to_double(b) : a < b;
++}
++
++inline bool ps2_fcmp_le(float a, float b)
++{
++    return ps2_fcmp_wide(a, b) ? ps2_to_double(a) <= ps2_to_double(b) : a <= b;
++}
++
+ inline float ps2_from_double(double d)
+ {
+     const double magnitude = std::fabs(d);
+@@ -864,11 +888,11 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
+ #define FPU_CVT_L_S(a) ((int64_t)(float)(a))
+ #define FPU_C_F_S(a, b) (0)
+ #define FPU_C_UN_S(a, b) (isnan((float)(a)) || isnan((float)(b)))
+-#define FPU_C_EQ_S(a, b) ((float)(a) == (float)(b))
++#define FPU_C_EQ_S(a, b) ps2_fcmp_eq((float)(a), (float)(b))
+ #define FPU_C_UEQ_S(a, b) ((float)(a) == (float)(b) || isnan((float)(a)) || isnan((float)(b)))
+-#define FPU_C_OLT_S(a, b) ((float)(a) < (float)(b))
++#define FPU_C_OLT_S(a, b) ps2_fcmp_lt((float)(a), (float)(b))
+ #define FPU_C_ULT_S(a, b) ((float)(a) < (float)(b) || isnan((float)(a)) || isnan((float)(b)))
+-#define FPU_C_OLE_S(a, b) ((float)(a) <= (float)(b))
++#define FPU_C_OLE_S(a, b) ps2_fcmp_le((float)(a), (float)(b))
+ #define FPU_C_ULE_S(a, b) ((float)(a) <= (float)(b) || isnan((float)(a)) || isnan((float)(b)))
+ #define FPU_C_SF_S(a, b) (0)
+ #define FPU_C_NGLE_S(a, b) (isnan((float)(a)) || isnan((float)(b)))

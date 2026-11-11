@@ -42,6 +42,7 @@ add_executable(blade_recomp
   "${CMAKE_CURRENT_SOURCE_DIR}/blade_overrides.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/blade_devtools.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/blade_input.cpp"
-  "${CMAKE_CURRENT_SOURCE_DIR}/blade_audio.cpp")
+  "${CMAKE_CURRENT_SOURCE_DIR}/blade_audio.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/qa_deterministic.cpp")
 target_include_directories(blade_recomp PRIVATE "${GEN}/output2")
 target_link_libraries(blade_recomp PRIVATE ps2_runtime)

@@ -450,6 +450,16 @@ Detalle y evidencia en `docs/` (`QA_REPORT.md`, `AIRBLADE_STATUS.md`, `AIRBLADE_
   anaden pulsaciones extra de X (2700, 2900, 3100) el juego llega a otro estado y el personaje pasa por detras de la camara:
   no es un fallo de dibujo. El resultado es identico con y sin `PS2X_VU1_NOGEN=1` (el VU1 compilado no es la causa). Sigue
   abierto (AB-004, confirmado contra PCSX2): la tabla llega al GS con A = 0 (112,112,128,0) y la sombra no se ve.
+  Biseccion AB-004 (2026-11-11, modo determinista, tick 3100; trazas con `BLADE_RT_TRACE=desde,hasta` y
+  `BLADE_RT_FUNCS=dir,dir...` en `runner/blade_overrides.cpp`): (1) el jugador EXISTE: atomico 0xC07DE0 (flags 0x01050001,
+  callback 0x200740, pipeline 0x1ECCF00) en el marco 0xC04770, clump 0xC046B0, a ~3 unidades de la camara y dentro del
+  frustum (camara 120,61 / 4,36 / 131,8; jugador 117,6 / 3,58 / 132,87). (2) NO llega a dibujarse: la funcion de dibujo por
+  defecto de atomicos (0x200740, desde RpClumpRender 0x2014F0) solo recibe 8 atomicos por imagen (peatones y escenario),
+  ninguno del clump del jugador; y la lista de render del juego (`0x2F8700`, relleno por 0x12E8D0, vaciado por 0x12F560)
+  contiene 4 clumps de 0xFF de alfa, ninguno el 0xC046B0. Es decir, el jugador no se encola; la causa esta aguas arriba
+  (el metodo de dibujo del jugador, vtable 0x2FECE0 [7] = 0x13CD40 -> 0x149E60 -> vtable 0x303E20 [7] = 0x14CF90, que
+  encola con 0x12E8D0, no se llama o sale antes; el A = 0 visto antes era otro efecto). Sin resolver (la maquina perdio la
+  sesion grafica y no se pudieron hacer mas corridas).
 - Pendiente 3: rendimiento (2026-11-11, `BLADE_STATS=1`, Mac M1 de 8 nucleos; medidas con otros procesos pesados
   compitiendo, orientativas). Menu a 50 VSync/s fijos (a ritmo real, PAL); partida del nivel 1 entre 14 y 22 VSync/s
   (antes 16 VSync/s a 60 Hz). Ya no hay espera activa: en la partida el hilo del EE esta ~100 % ocupado, ~75 % en el

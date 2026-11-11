@@ -14,8 +14,43 @@
 void bladeStartDevTools(PS2Runtime &runtime); // blade_devtools.cpp
 void bladeStartKeyboardMouse(PS2Runtime &runtime); // blade_input.cpp
 
+extern unsigned long long gBladeQaTick; // qa_deterministic.cpp
+
 namespace
 {
+    // Traza de depuracion (AB-004): BLADE_RT_TRACE=desde,hasta (VBlank). Registra cada llamada a la funcion de dibujo de
+    // atomicos de RenderWare (0x200740 = RpAtomicRender por defecto: usa el pipeline del atomico y llama a 0x1D83B0).
+    uint32_t readGuest32(const uint8_t *rdram, uint32_t address);
+    PS2Runtime::RecompiledFunction gRtAtomicRender = nullptr;
+    unsigned long long gRtFrom = 0, gRtTo = 0;
+    // BLADE_RT_FUNCS=0xDIR,0xDIR...: ademas, registra entrada (a0-a3, ra) de esas funciones durante la ventana de BLADE_RT_TRACE.
+    PS2Runtime::RecompiledFunction gRtOrig[8] = {};
+    uint32_t gRtAddr[8] = {};
+    template <int N>
+    void ovTraceGeneric(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (gRtTo && gBladeQaTick >= gRtFrom && gBladeQaTick <= gRtTo)
+            std::printf("[rtf] tick %llu fn=%08x a0=%08x a1=%08x a2=%08x a3=%08x ra=%08x\n", gBladeQaTick, gRtAddr[N], GPR_U32(ctx, 4),
+                        GPR_U32(ctx, 5), GPR_U32(ctx, 6), GPR_U32(ctx, 7), GPR_U32(ctx, 31));
+        gRtOrig[N](rdram, ctx, runtime);
+    }
+    void ovTraceAtomicRender(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t a = GPR_U32(ctx, 4);
+        const bool on = gRtTo && gBladeQaTick >= gRtFrom && gBladeQaTick <= gRtTo;
+        if (on)
+        {
+            const uint32_t fr = readGuest32(rdram, a + 4u), pipe = readGuest32(rdram, a + 0x6Cu);
+            float px, py, pz; uint32_t b;
+            b = readGuest32(rdram, fr + 0x80u); std::memcpy(&px, &b, 4);
+            b = readGuest32(rdram, fr + 0x84u); std::memcpy(&py, &b, 4);
+            b = readGuest32(rdram, fr + 0x88u); std::memcpy(&pz, &b, 4);
+            std::printf("[rt] tick %llu atomic=%08x flags=%08x geom=%08x pipe=%08x pos=%.2f,%.2f,%.2f ra=%08x\n", gBladeQaTick, a,
+                        readGuest32(rdram, a), readGuest32(rdram, a + 0x18u), pipe, px, py, pz, GPR_U32(ctx, 31));
+        }
+        gRtAtomicRender(rdram, ctx, runtime);
+    }
+
     // 0x113F40 = sceCdDiskReady(mode) de libcdvd. El ELF no tiene simbolos y el analizador no la reconocio, asi que se
     // traducia el codigo original: reintenta sceSifBindRpc(0x8000059A) hasta que responda el servidor CDVDFSV del IOP,
     // que en este runtime no existe (vive en la BIOS). Identificada por la forma: modo 8 = no bloqueante (devuelve 6 si
@@ -182,6 +217,28 @@ namespace
         if (std::getenv("BLADE_NO_SKYWAIT") == nullptr)
             for (const uint32_t pc : {kSkyWaitEntry, kSkyWaitLoop, kSkyWaitAfterKick, 0x001DF550u, 0x001DF570u})
                 runtime.replaceFunction(pc, ovSkyWaitQueue);
+        if (const char *t = std::getenv("BLADE_RT_TRACE"); t && *t)
+        {
+            gRtFrom = std::strtoull(t, nullptr, 10);
+            const char *c = std::strchr(t, ',');
+            gRtTo = c ? std::strtoull(c + 1, nullptr, 10) : gRtFrom;
+            gRtAtomicRender = runtime.lookupFunction(0x00200740u);
+            if (gRtAtomicRender)
+                runtime.replaceFunction(0x00200740u, ovTraceAtomicRender);
+            if (const char *fl = std::getenv("BLADE_RT_FUNCS"); fl && *fl)
+            {
+                static const PS2Runtime::RecompiledFunction stubs[8] = {ovTraceGeneric<0>, ovTraceGeneric<1>, ovTraceGeneric<2>, ovTraceGeneric<3>,
+                                                                       ovTraceGeneric<4>, ovTraceGeneric<5>, ovTraceGeneric<6>, ovTraceGeneric<7>};
+                int n = 0;
+                for (const char *q = fl; *q && n < 8;)
+                {
+                    gRtAddr[n] = static_cast<uint32_t>(std::strtoul(q, const_cast<char **>(&q), 16));
+                    gRtOrig[n] = runtime.lookupFunction(gRtAddr[n]);
+                    if (gRtOrig[n]) { runtime.replaceFunction(gRtAddr[n], stubs[n]); ++n; }
+                    if (*q == ',') ++q;
+                }
+            }
+        }
         useDiscImage();
         bladeStartDevTools(runtime);
         bladeStartKeyboardMouse(runtime);

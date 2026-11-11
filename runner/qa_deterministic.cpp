@@ -17,6 +17,8 @@
 
 extern void (*ps2xQaVSyncHook)(PS2Runtime &, uint64_t);
 
+unsigned long long gBladeQaTick = 0; // VBlank actual, para trazas de depuracion de otros ficheros del runner
+
 namespace ps2_stubs
 {
     void setPadOverrideState(uint16_t buttons, uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry);
@@ -72,6 +74,7 @@ namespace
 
     void hook(PS2Runtime &rt, uint64_t tick)
     {
+        gBladeQaTick = tick;
         uint16_t mask = 0; uint8_t lx = 0x80, ly = 0x80; bool any = false;
         for (const Step &s : gSteps)
             if (tick >= s.start && tick < s.end)

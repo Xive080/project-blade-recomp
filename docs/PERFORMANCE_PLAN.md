@@ -25,6 +25,31 @@ hipotesis va marcado **[H]**.
 
 ## 0. Revision 2026-11-12: meta 60/120 tras M0
 
+### 0.0 Requisito: multiplataforma (2026-11-12, decision del usuario; manda sobre el resto de este plan)
+El juego es multiplataforma, asi que **todo lo que se construya para rendimiento debe funcionar en macOS (Apple Silicon e Intel), Windows y
+Linux**, no solo en el M1. Donde el plan dice «Metal» o «NEON» se lee «via portable» y «SIMD portable». Reglas:
+1. **GS en GPU (G2/D2): una sola implementacion con API portable**, no Metal propio. Candidatos que valen en las tres plataformas:
+   **Vulkan** (en Mac via MoltenVK; paraLLEl-GS ya es Vulkan compute) o **WebGPU/wgpu** (D3D12/Vulkan/Metal; es lo que usa
+   `ps2-native-recomp`, ver `REFERENCIA_PS2_NATIVE_RECOMP.md`, aunque ahi se descarto como dependencia por tamano; revalorar: ahora
+   la portabilidad pesa mas que ese coste). D2 compara estas dos vias con tres criterios: paridad bit a bit con la CPU, rendimiento en
+   Mac (MoltenVK/Metal), y que no obligue a mantener tres backends. El rasterizador de CPU sigue siendo la referencia y el respaldo en
+   cualquier plataforma sin GPU compatible.
+2. **VU1 compilado (P1-P7): SIMD portable.** El generador emite la misma logica para **NEON (arm64) y SSE4.1/AVX2 (x86_64)** mediante una
+   capa fina de intrinsecos (o `std::experimental::simd`/ `xsimd`) y siempre con una **ruta escalar** exacta como respaldo. Nada de
+   ensamblador ni de supuestos de arm64. P7 («NEON») pasa a ser «SIMD con control por bloque» y se mide en las dos familias.
+3. **Oraculo y determinismo (D1, hecho):** `-ffp-contract=off`, `-frounding-math`, `double` explicito; hay que **repetir el banco
+   `BLADE_VU1_DIFF` y la regresion en una segunda arquitectura (x86_64) antes de dar por bueno cualquier paso** de VU1. Los hashes de la
+   regresion deben ser iguales en todas las plataformas; si no, es un fallo, no una tolerancia (excepcion posible y declarada: la GPU).
+4. **Hilos (T1) y tiempo:** nada de `pthread`/`mach` propios; `std::thread`, colas portables, afinidad/QoS tras una capa de plataforma.
+5. **Rutas, build y CI:** sin rutas absolutas (calcular en tiempo de ejecucion); CMake con las tres plataformas; los parches de `patches/`
+   y `scripts/` sin bashismos de macOS (`sed -i ''`, `/Users/...`). Las maquinas de CI son las de la memoria (Titan = Linux, PC Studio =
+   Windows, Mac = macOS): cada hito se valida en las tres antes de cerrarse.
+6. **Medidas:** las cifras de V/s actuales son de un M1; hay que tomar una linea base equivalente en Windows y Linux (M0-f, nuevo, Sonnet)
+   para saber si el cuello cambia (p. ej. en x86 el intérprete puede ir mejor o peor y la GPU de escritorio cambia el techo del GS).
+7. **Impacto en el reparto:** D2 vuelve a ser decision de Opus con mas peso; P7 y G2 necesitan ademas una subtarea de **portabilidad**
+   (SIMD x86 y backend de GPU en Windows/Linux) y su validacion; el ahorro estimado de la referencia (sesiones) se reduce porque ya no
+   se puede asumir Metal. Estimacion: **+4-10 sesiones** sobre los rangos de §6 **[H]**.
+
 ### 0.1 Que dice M0 y que cambia (contrastado con `PERFORMANCE_BASELINE.md`, seccion "M0 medir")
 | Dato de M0 | Cifra | Consecuencia para el plan |
 |---|---|---|
@@ -76,12 +101,12 @@ mismo build ni el mismo parche (regla del ADR); las medidas de V/s se hacen de u
 | 4 | P1 → P2 → P3 → P4 → P5 → P6 (§3, sin cambios de fondo; P4/P6 cubren el corpus de 5 escenas) | VU1 | Opus / Sonnet | D1, M0-a | 30-55 V/s de capacidad del EE |
 | 5 | **G0** (nuevo) clasificar las ~8 000 primitivas serie por VSync | GS | Sonnet | — | G1-a, G2 |
 | 6 | **G1-a** (nuevo, sustituye a G1) comprobacion de solape exacta en la CPU | GS | Sonnet (+Opus si hay diferencias) | G0 | +5-10 V/s de techo de CPU y la regla de barreras de G2 |
-| 7 | **D2** (nuevo) decidir la via de GPU: Metal propio frente a reaprovechar un backend | GS | Opus | G0 | G2 |
+| 7 | **D2** (nuevo) decidir la via de GPU **portable** (Vulkan/MoltenVK o wgpu; no Metal propio, ver §0.0) | GS | Opus | G0 | G2 |
 | 8 | **G2** (nuevo) backend del GS en GPU, v1 exacta y v2 rapida | GS | Opus (diseno, depuracion) + Sonnet (formatos y funciones, con banco) | D2 | 60 y 120 |
 | 9 | **T1** VU1 en su hilo (§3) | VU1 | Opus | P5 | 60 |
 | 10 | **L0** (nuevo) experimento del tiempo del juego | comun | Sonnet | — (cuanto antes) | elegir L1 o I1 |
 | 11 | **L1** 60 con `dt` 1/60, o **I1** interpolacion del dibujo | comun | Opus | L0 | 60 en pantalla |
-| 12 | **P7** (nuevo) VU1 en NEON con control por bloque | VU1 | Opus | P6 | 120 |
+| 12 | **P7** (nuevo) VU1 en SIMD portable (NEON + SSE/AVX2, con ruta escalar) con control por bloque (§0.0) | VU1 | Opus | P6 | 120 |
 | 13 | **E1** (nuevo) dibujo del EE ≤7 ms | comun | Opus + Sonnet | M0-e | 120 |
 | 14 | **I1** interpolacion a 120 (si L1 fue la via de 60, aqui se hace igualmente) | comun | Opus | L0 | 120 |
 

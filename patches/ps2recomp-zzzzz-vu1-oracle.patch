@@ -1,0 +1,142 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -427,6 +427,13 @@
+     )
+ endif()
+ 
++# Oraculo de coma flotante del VU1 (decision D1): sin contraccion FMA (el VU de PS2 no funde MADD/MSUB) y sin suponer
++# redondeo al mas cercano (run() usa FE_TOWARDZERO). Asi el interprete da los mismos bits en arm64, x86 y con cualquier clang/gcc.
++set(PS2X_VU1_FP_FLAGS -ffp-contract=off -frounding-math)
++set_source_files_properties(
++    src/lib/vu/ps2_vu1_core.cpp src/lib/vu/ps2_vu1_upper.cpp src/lib/vu/ps2_vu1_lower.cpp src/lib/vu/ps2_vu1_gen.cpp
++    PROPERTIES COMPILE_OPTIONS "${PS2X_VU1_FP_FLAGS}")
++
+ # Microprogramas VU1 compilados: carpeta generada desde el disco del usuario (no versionada), p. ej.
+ # -DPS2X_VU1GEN_DIR=<repo>/work/vu1gen (con vu1gen_table.inc y vu1gen_unit_N.inc). Cada trozo es una unidad de
+ # compilacion (se compilan en paralelo). Sin la carpeta, el VU1 se interpreta como siempre. Hay que volver a
+@@ -442,7 +449,7 @@
+         set(unit_cpp "${CMAKE_CURRENT_BINARY_DIR}/${unit_name}.cpp")
+         file(WRITE "${unit_cpp}" "#define VU1GEN_UNIT_FILE \"${unit}\"\n#include \"${CMAKE_CURRENT_SOURCE_DIR}/src/lib/vu/ps2_vu1_gen_unit.cpp\"\n")
+         target_sources(ps2_runtime PRIVATE "${unit_cpp}")
+-        set_source_files_properties("${unit_cpp}" PROPERTIES OBJECT_DEPENDS "${unit}")
++        set_source_files_properties("${unit_cpp}" PROPERTIES OBJECT_DEPENDS "${unit}" COMPILE_OPTIONS "${PS2X_VU1_FP_FLAGS}")
+     endforeach()
+ endif()
+ 
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -1277,7 +1277,7 @@
+         if ((dest & laneForComponent(component)) == 0u)
+             continue;
+ 
+-        long double exactResult = 0.0L;
++        double exactResult = 0.0;
+         if (calculateFmacExactResult(component, exactResult))
+         {
+             laneFlags[component] = normalizeFmacExactResult(result[component], exactResult);
+@@ -1291,7 +1291,7 @@
+ }
+ 
+ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
+-                                               long double &result) const
++                                               double &result) const
+ {
+     const uint32_t upper = m_currentUpperInstruction;
+     const uint8_t op = static_cast<uint8_t>(upper & 0x3Fu);
+@@ -1303,7 +1303,7 @@
+ 
+     const auto operand = [this](float value)
+     {
+-        return static_cast<long double>(normalizeOperand(value));
++        return static_cast<double>(normalizeOperand(value));
+     };
+     const auto vs = [&](uint32_t lane)
+     {
+@@ -1318,8 +1318,8 @@
+         return operand(m_state.acc[lane]);
+     };
+ 
+-    const long double q = operand(m_state.q);
+-    const long double i = operand(m_state.i);
++    const double q = operand(m_state.q);
++    const double i = operand(m_state.i);
+ 
+     if (op < 0x3Cu)
+     {
+@@ -1387,7 +1387,7 @@
+                 static constexpr uint8_t left[4] = {1u, 2u, 0u, 3u};
+                 static constexpr uint8_t right[4] = {2u, 0u, 1u, 3u};
+                 result = component == 3u
+-                             ? 0.0L
++                             ? 0.0
+                              : acc(component) - vs(left[component]) * vt(right[component]);
+                 break;
+             }
+@@ -1462,7 +1462,7 @@
+             static constexpr uint8_t left[4] = {1u, 2u, 0u, 3u};
+             static constexpr uint8_t right[4] = {2u, 0u, 1u, 3u};
+             result = component == 3u
+-                         ? 0.0L
++                         ? 0.0
+                          : vs(left[component]) * vt(right[component]);
+             break;
+         }
+@@ -1474,16 +1474,16 @@
+ }
+ 
+ uint8_t VU1Interpreter::normalizeFmacExactResult(float &value,
+-                                                  long double exactResult) const
++                                                  double exactResult) const
+ {
+     const bool negative = std::signbit(exactResult);
+-    const long double magnitude = std::fabs(exactResult);
+-    const long double maximum = static_cast<long double>(std::numeric_limits<float>::max());
+-    const long double minimum = static_cast<long double>(std::numeric_limits<float>::min());
++    const double magnitude = std::fabs(exactResult);
++    const double maximum = static_cast<double>(std::numeric_limits<float>::max());
++    const double minimum = static_cast<double>(std::numeric_limits<float>::min());
+     uint8_t flags = negative ? 0x2u : 0u;
+ 
+     uint32_t bits = negative ? 0x80000000u : 0u;
+-    if (magnitude == 0.0L)
++    if (magnitude == 0.0)
+     {
+         flags |= 0x1u;
+         std::memcpy(&value, &bits, sizeof(value));
+@@ -1552,7 +1552,7 @@
+         }
+ 
+         float product = left * right;
+-        const long double exactProduct = static_cast<long double>(left) * static_cast<long double>(right);
++        const double exactProduct = static_cast<double>(left) * static_cast<double>(right);
+         const uint8_t productFlags = normalizeFmacExactResult(product, exactProduct);
+         // Product-sum instructions report Z/S/U/O from the add/subtract result
+         // as current flags, while every product condition accumulates into the
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_fmac.inc b/ps2xRuntime/src/lib/vu/ps2_vu1_fmac.inc
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_fmac.inc
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_fmac.inc
+@@ -111,7 +111,7 @@
+ __attribute__((always_inline)) inline bool VU1Interpreter::fastFmacFlags(const float *result, uint8_t dest, uint8_t laneFlags[4], uint32_t &extraSticky) const
+ {
+     // Camino rapido de normalizeFmacResult + calculateFmacProductSticky. Con operandos y resultado
+-    // en rango, el calculo exacto (long double) no puede dar cero, desbordamiento ni subdesbordamiento
++    // en rango, el calculo exacto (double) no puede dar cero, desbordamiento ni subdesbordamiento
+     // y su signo es el del resultado en float: la unica bandera es S y el valor no cambia. En otro
+     // caso se devuelve false y se usa el calculo exacto de siempre.
+     const uint32_t upper = m_currentUpperInstruction;
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
+--- a/ps2xRuntime/include/runtime/ps2_vu1.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1.h
+@@ -248,8 +248,8 @@
+     void applyFmacDest(float *dst, float *result, uint8_t dest);
+     void applyFmacDestAcc(float *result, uint8_t dest);
+     void normalizeFmacResult(float *result, uint8_t dest, uint8_t laneFlags[4]);
+-    bool calculateFmacExactResult(uint32_t component, long double &result) const;
+-    uint8_t normalizeFmacExactResult(float &value, long double exactResult) const;
++    bool calculateFmacExactResult(uint32_t component, double &result) const;
++    uint8_t normalizeFmacExactResult(float &value, double exactResult) const;
+     uint32_t calculateFmacProductSticky(uint8_t dest) const;
+     bool fastFmacFlags(const float *result, uint8_t dest, uint8_t laneFlags[4], uint32_t &extraSticky) const;
+     void updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest, uint32_t extraSticky);

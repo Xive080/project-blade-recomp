@@ -165,6 +165,12 @@ Propios:
   (`PS2X_VU1_KICKDUMP_PRIM=hex` elige un PRIM concreto). Con esto se encontro AB-017.
 - `ps2recomp-zzz-vu1-diffbench.patch` (herramienta, sin efecto sin `BLADE_VU1_DIFF`; solo toca `ps2_vu1_core.cpp`, sin cabeceras): banco
   diferencial interprete contra implementacion compilada sobre grabaciones del VU1; ver `BLADE_VU1_DIFF` en Herramientas.
+- `ps2recomp-zzzzz-vu1-oracle.patch` (D1, fija el oraculo de coma flotante del VU1): `-ffp-contract=off -frounding-math` para
+  `src/lib/vu/ps2_vu1_{core,upper,lower,gen}.cpp` y las unidades `vu1gen_unit_N` (CMake del runtime) y `double` explicito en lugar de
+  `long double` en `calculateFmacExactResult`/`normalizeFmacExactResult`/producto de las MADD. Antes, en arm64 clang fundia MADD/MSUB
+  (35 `fmadd`/`fmsub` en `execUpper`), lo que el VU de PS2 no hace, y `long double` daba otros bits en x86. **Cambio de referencia**:
+  el interprete ya no reproduce las grabaciones `*.rec` hechas antes (hay que volver a grabarlas) ni `qa/ref_det` anterior
+  (regenerada 2026-11-12 con este parche). Comprobacion: `objdump -d` sin `fmadd`/`fmsub` en ninguna funcion del VU1.
 - `ps2recomp-zz-guest-heap.patch`: el monticulo del juego (`SetupHeap(.., -1)`/`EndOfHeap`) acababa en 0x01F00000
   porque ahi vivian los pools HLE del runtime (paquetes y servidores RPC, TLS, modo de arranque, 0x01F00000-0x01F31000).
   En la consola el monticulo llega hasta la pila del hilo principal (AirBlade: 0x01FF8000). AirBlade lo llena casi

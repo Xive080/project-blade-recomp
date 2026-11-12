@@ -467,7 +467,18 @@ unica: <texto del paso>. No cambies el interprete ni la semantica; los cambios d
 `scripts/check_patches.sh`. No limpies `build/blade`. Una corrida a la vez, maquina en reposo. Entrega: tabla de cifras con
 comando, commit y load average; commit sin coautor ni mencion de IA, sin push. Si algo no cuadra, para y dilo."
 
-### D1. Decidir el oraculo (Opus) — antes de P1
+### D1. Decidir el oraculo (Opus) — antes de P1 — HECHO (2026-11-12, opcion b)
+**Resultado**: parche `patches/ps2recomp-zzzzz-vu1-oracle.patch` (`check_patches.sh` identico): `-ffp-contract=off -frounding-math` en los
+`.cpp` de `src/lib/vu/` y en las unidades generadas, y `double` en lugar de `long double`. `objdump -d`: 0 `fmadd`/`fmsub`/`fnm*`
+en todas las funciones del VU1 (antes 35 en `execUpper`). Banco `BLADE_VU1_DIFF` sobre `nivel.rec` y `corpus/e1-e5.rec`
+(135 000 llamadas): **0 diferencias A!=B** con `B=interp` y con `B=VU1_GEN` actual (build con `PS2X_VU1GEN_DIR=work/vu1gen`, que
+se volvio a dejar vacio). **Cambio de referencia respecto a lo grabado**: el nuevo A no reproduce las grabaciones antiguas en
+29 999 de 30 000 llamadas de `nivel.rec` (28 238 en `vf`, 25 en `acc`, 1 736 sin campo concreto, es decir solo cambia la memoria
+o el GIF) y en 15 000 de 15 000 de cada e1-e5 (campos `vf`, `acc`, `q`, `vi`, ver `qa/`-no versionado). Aislado: con
+`-ffp-contract=on` y el resto igual, 0 no reproducidas, asi que `long double`->`double` y `-frounding-math` no cambian nada en arm64 y
+toda la diferencia es la FMA. Las grabaciones del corpus hay que regrabarlas (M0-c otra vez) antes de P1. `qa/ref_det` regenerada
+con `-b build/blade/blade_recomp` (no existe `build/qa` en este clon): dos regresiones seguidas, hitos 650/900/1100/3000/3900
+IGUAL y 78 de 78 hashes RAM/imagen IGUALES, 0 errores. Sin comparar contra PCSX2 ni contra imagenes anteriores (no se conservan).
 Que cambia: `-ffp-contract=off` y `-frounding-math` para `src/lib/vu/*` y `double` explicito en lugar de `long double` en la ruta
 exacta (un parche nuevo). Despues se regeneran `qa/ref_det` y las grabaciones del corpus (M0-c otra vez). Criterio: `execUpper`
 sin `fmadd`/`fmsub` en el desensamblado; el banco con `B=interp` en 0; las imagenes de los ticks 100, 900, 3100 y 3160 en

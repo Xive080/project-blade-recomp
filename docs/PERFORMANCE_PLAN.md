@@ -1,12 +1,316 @@
-# PERFORMANCE_PLAN: de 11-15 V/s a 50 (PAL), y despues a 60 y 120
+# PERFORMANCE_PLAN: de 11-15 V/s a 60 como minimo y 120 de objetivo (revisado tras M0)
 
 Fecha: 2026-11-12. Base: `main` en c6d6c69 (linea base limpia de AB-001). Es un plan: no cambia codigo.
+**Revision 2026-11-12 (tras M0, commit d2044e4)**: la meta pasa de 50 V/s a **60 como minimo y 120 como objetivo** (peticion del
+usuario: "nativamente deberias de ir minimo 60 o 120 fps"). La revision esta en la seccion 0 y manda sobre el resto; las
+secciones 1-6 son el plan original (a1eedd5), que se conserva, con notas fechadas donde M0 o la meta nueva lo dejan obsoleto.
 Fuentes: `docs/PERFORMANCE_BASELINE.md` (seccion 2026-11-12), README (Pendiente 3, VU1 compilado, `BLADE_VU1_DIFF`, Plan B),
 `ps2xRuntime/src/lib/vu/*` (interprete y ruta `VU1_GEN`), `work/vu1gen/` (`nivel.rec` y los `.inc` generados),
 `work/output_orig` (bucle principal del juego) y `EeScheduler.cpp`. Lo que he comprobado yo esta en el anexo A; lo que es
 hipotesis va marcado **[H]**.
 
-## Resumen (10 lineas)
+## Resumen de la revision 2026-11-12 (10 lineas)
+1. M0 cambia el techo: el GS por CPU **no pasa de ~30 V/s** (aislado 23-30, en vivo 38, escena pesada 21): ~28 ms/V son serie y no escalan (4 bandas 35,5 ms, 8 bandas 34,8). Para 60 hace falta GS ≤16,7 ms y para 120 ≤8,3: **con CPU no se llega**.
+2. Por eso el **GS en GPU (Metal) entra como hito temprano (G2)**, en una via paralela al VU1 (otro worktree y otro build), verificado contra el rasterizador de CPU, que sigue siendo la referencia.
+3. El VU1 compilado sigue primero: es el 92 % del hilo EE. Presupuesto en el mismo hilo: 60 V/s pide VU1 ≤9-11 ms (**x8-9,5**); con el VU1 en su hilo (T1), ≤15 ms (**x5,5**). 120 solo con T1: VU1 ≤7 ms (**x12**).
+4. x12 son ~4 ns por ciclo del VU1 (~14 instrucciones de la CPU por par). Con el histograma (87 % FMAC util, MADD/MADDA/MULA con difusion, 53 % load/store) cabe en NEON solo si las banderas y el control de exponentes se hacen por bloque y no por FMAC (paso nuevo P7) **[H]**.
+5. Corpus M0: 72 microprogramas en 5 escenas, los 8 primeros 96,5-97,3 % de ciclos, pero 10-15 % esta en programas de entrada 0000 que cambian con la escena: el generador compila por contenido (todas las imagenes vistas) con el interprete de respaldo; JIT/cache solo si los niveles 2+ lo piden.
+6. D1 (oraculo FP: `-ffp-contract=off`, `-frounding-math`, `double` explicito) esta **en curso** en otro agente; despues, M0-a (referencias).
+7. Tiempo del juego: logica a 50 pasos/s atada al VBlank. En el codigo, 53 funciones leen `dt`, pero **9 funciones fuera del bucle construyen el literal 0,02 y 13 el 50,0**: "VBlank 60 + dt 1/60" no sale gratis. Un experimento acotado (L0, 1-2 sesiones) decide entre eso e interpolar.
+8. Para 120 lo realista es **interpolar el dibujo** (logica a 50, dibujo a 120): camara, `RwFrame` de entidades y huesos, con cortes de camara, teletransportes y UI como riesgos; y la parte de dibujo del EE tiene que caber en ~7 ms (medida M0-e).
+9. Nuevo orden: D1 → M0-a/M0-e → P1-P6 (VU1) **en paralelo con** G0 → G1-a → D2 → G2 (GPU) → T1 → L0/L1 (60 en pantalla) → P7 + E1 + I1 (120).
+10. Estimacion: 60 V/s en pantalla en ~40-90 sesiones de trabajo (camino critico ~25-55 con la via del GS en paralelo); 120 en ~55-110 (critico ~40-70), con hipotesis fuertes. Las incognitas que mas mueven el plan estan en 0.8.
+
+---
+
+## 0. Revision 2026-11-12: meta 60/120 tras M0
+
+### 0.1 Que dice M0 y que cambia (contrastado con `PERFORMANCE_BASELINE.md`, seccion "M0 medir")
+| Dato de M0 | Cifra | Consecuencia para el plan |
+|---|---|---|
+| GS aislado (`PS2X_GS_BENCH`, 4 bandas) | 32,6-44,5 ms/V = **23-30 V/s** (central 28) | el GS por CPU es el techo a partir de ~25-35 V/s |
+| GS en vivo (pared del rasterizador en `SubmitMany`) | mediana 26,4 ms = 38 V/s; escena pesada 46,7 ms = 21 V/s | las dos medidas no cuadran ±15 %; mejor estimacion **~30 V/s** |
+| Escalado con bandas | 1 banda 58,4 ms, 4 bandas 35,5, 8 bandas 34,8 → s ≈ 28 ms serie, p ≈ 30 ms paralelo | mas hilos no ganan nada; con infinitas bandas el techo seria ~36 V/s |
+| Hilos | 1 rasterizador + 3 hilos de bandas = 4 de trabajo, en 8 nucleos logicos (4P+4E) | un hilo mas (T1) compite por los 4 P |
+| Parte serie | ~8 000 primitivas por VSync en serie, todas por "textura solapa destino" (~3 Mpx, ~12 ms de pared, ~13 % de las muestras del rasterizador) | el aliasing de memoria del GS es el problema de fondo, en CPU y en GPU |
+| Corpus VU1 (5 escenas del nivel 1) | 72 microprogramas en la union; 8 primeros = 96,5-97,3 % de los ciclos de cada escena; leave-one-out 86-100 % | la cola (10-15 %, entrada 0000 por objeto) cambia con la escena: compilar por contenido + interprete de respaldo |
+| Histograma de pares | 133,0 M pares / 153,5 M ciclos (1,16 ciclos/par); superior 87,3 % FMAC util (MADDbc 14,6 %, MADDAbc 14,4 %, MULAbc 12,0 %); inferior load/store 52,7 % (LQ 29,4 %, SQI 10,5 %, SQ 7,0 %), IALU+banderas 19,4 %, branch 11,7 %, FDIV/SQRT 3,9 %, EFU ~0 | el VU1 es una transformacion de vertices: se mapea casi 1:1 a NEON (`fmul`/`fmla` por elemento, `ldr q`/`str q`); lo caro es lo que rodea a cada FMAC (banderas, normalizacion, horario) |
+
+Obsoleto por M0 (se conserva abajo como historia): el "techo del GS 34-43 V/s" de §1.2 y del resumen original (es ~23-38, ~30); el
+"G1 = GS por CPU para 50 y quiza 60" de §3 (para 60/120 el CPU no llega: queda G1-a como arreglo barato y referencia); "120 es un
+proyecto aparte" y "el GS en GPU no va antes de que el VU1 deje de ser el cuello" de §4.3 y §6 (sustituido por G2 en paralelo).
+Sigue valido: todo el diseno del recompilador (§2), P1-P6, la cadena de regresion (§5) y el analisis del bucle del juego (§4.1).
+
+### 0.2 Presupuesto para 60 y 120
+Modelo: fotograma = max(hilo EE, hilo VU1 si existe, GS). R = resto del EE (codigo del juego, desempaquetado del VIF, IOP, GIF) =
+5-7 ms hoy; VU1 interpretado = 83 ms/V (1,79 M ciclos x 46 ns); margen de 1 ms para la variacion.
+| Meta | Presupuesto | VU1 en el hilo EE (≤ presupuesto - R - 1) | Ganancia en el VU1 | VU1 en su hilo (T1; ≤ presupuesto - 1,5) | Ganancia | GS (hilo o GPU) |
+|---|---|---|---|---|---|---|
+| 50 | 20 ms | 12-14 ms | x5,9-6,9 | ≤18 ms | x4,6 | ≤18 ms: CPU no llega (35,5 hoy) |
+| **60** | 16,7 ms | 8,7-10,7 ms | **x7,8-9,5** | ≤15 ms | **x5,5** | ≤15 ms: **GPU** (CPU solo con G1-a muy bueno **[H improbable]**) |
+| **120** | 8,3 ms | 0,3-2,3 ms: **no** | x36+ | ≤7 ms, y R (la parte por fotograma) ≤7 ms | **x12** | ≤6 ms: **GPU** |
+
+En ns por ciclo del VU1: hoy 46; x5,5 → 8,4 ns (~27 instrucciones de la CPU a 3,2 GHz por ciclo, ~31 por par); x8 → 5,8 ns
+(~21 por par); x12 → 3,9 ns (**~14 por par**). Lectura:
+- **60 sin T1** pide x8-9,5, que es el limite alto de lo que el plan original esperaba de P6 (x5,5-8,5). **60 con T1** pide x5,5,
+  que P5/P6 deberian dar. Conclusion: **T1 entra en el camino de 60**, no es opcional.
+- **120** pide T1 y x12. Con D1 en vigor el `MADD` es `fmul` + `fadd` (dos redondeos, sin `fmla`): por par quedan ~2 instrucciones
+  de FMAC, 0-1 de mascara `dest` (`bsl`), 1-3 de la inferior (`ldr q`/`str q` + direccion, `add`, salto) y lo que cueste el control.
+  Si el control de exponentes y las banderas van **por FMAC** (rango [64,190]/[26,253], signo/cero, pegajosas) suben ~6-10 por
+  par y no se llega; **por bloque** (acumular una mascara de "fuera de rango" y comprobar una vez) si. Eso es P7 **[H]**.
+- **R a 120**: con interpolacion la logica va a 50 pasos/s y solo la parte de dibujo del EE se paga en cada fotograma. Hoy no
+  sabemos cuanto de los 5-7 ms es dibujo: lo mide M0-e. Con T1 el desempaquetado del VIF1 sale del hilo EE (va con el VU1).
+- **Nucleos**: el M1 tiene 4 P. Hoy: EE + rasterizador + 3 bandas. Con el GS en GPU desaparecen las 3 bandas y el rasterizador
+  queda como hilo ligero de envio; eso **libera nucleos P para T1**. Es otra razon para adelantar G2.
+
+### 0.3 Nuevo orden de trabajo (sustituye al de §3; los pasos de §3 que no se mencionan siguen igual)
+Dos vias que no tocan los mismos ficheros: **via VU1** (`src/lib/vu/*`, parches del VU1, `build/blade`) y **via GS**
+(`src/lib/gs/*`, parche nuevo del backend GPU, **worktree propio con su build**, p. ej. `build/gpu`). Nunca dos agentes sobre el
+mismo build ni el mismo parche (regla del ADR); las medidas de V/s se hacen de una en una con la maquina en reposo.
+
+| # | Paso | Via | Quien | Depende de | Para que |
+|---|---|---|---|---|---|
+| 1 | **D1** oraculo FP | VU1 | Opus (**en curso**, otro agente) | — | P1 |
+| 2 | **M0-a** referencias `qa/ref_det` con el oraculo de D1 | comun | Sonnet | D1 | toda la regresion |
+| 3 | **M0-e** (nuevo) reparto de R (logica frente a dibujo en el hilo EE) e histograma del estado del GS | comun | Sonnet | — | 120, G2 |
+| 4 | P1 → P2 → P3 → P4 → P5 → P6 (§3, sin cambios de fondo; P4/P6 cubren el corpus de 5 escenas) | VU1 | Opus / Sonnet | D1, M0-a | 30-55 V/s de capacidad del EE |
+| 5 | **G0** (nuevo) clasificar las ~8 000 primitivas serie por VSync | GS | Sonnet | — | G1-a, G2 |
+| 6 | **G1-a** (nuevo, sustituye a G1) comprobacion de solape exacta en la CPU | GS | Sonnet (+Opus si hay diferencias) | G0 | +5-10 V/s de techo de CPU y la regla de barreras de G2 |
+| 7 | **D2** (nuevo) decidir la via de GPU: Metal propio frente a reaprovechar un backend | GS | Opus | G0 | G2 |
+| 8 | **G2** (nuevo) backend del GS en GPU, v1 exacta y v2 rapida | GS | Opus (diseno, depuracion) + Sonnet (formatos y funciones, con banco) | D2 | 60 y 120 |
+| 9 | **T1** VU1 en su hilo (§3) | VU1 | Opus | P5 | 60 |
+| 10 | **L0** (nuevo) experimento del tiempo del juego | comun | Sonnet | — (cuanto antes) | elegir L1 o I1 |
+| 11 | **L1** 60 con `dt` 1/60, o **I1** interpolacion del dibujo | comun | Opus | L0 | 60 en pantalla |
+| 12 | **P7** (nuevo) VU1 en NEON con control por bloque | VU1 | Opus | P6 | 120 |
+| 13 | **E1** (nuevo) dibujo del EE ≤7 ms | comun | Opus + Sonnet | M0-e | 120 |
+| 14 | **I1** interpolacion a 120 (si L1 fue la via de 60, aqui se hace igualmente) | comun | Opus | L0 | 120 |
+
+### 0.4 Hitos y V/s esperados (nivel 1, tramo 2600-3900, media; rangos)
+"Capacidad" = 1000 / max(EE, VU1, GS) en ms, es decir los V/s si el ritmo no estuviera atado al VBlank de 50 Hz. Con la logica a
+50 pasos/s, mas de 50 en pantalla solo se ve despues de L1/I1.
+| Hito | Que lo cierra | VU1 (x sobre el interprete) | GS | Capacidad esperada | En pantalla |
+|---|---|---|---|---|---|
+| H0 hoy | `VU1_GEN` | x1,4 | CPU ~30 V/s | 14,6 (medido) | 14,6 |
+| H1 | P2 (r1810) | x1,8-2,3 | CPU | 17-21 | 17-21 |
+| H2 | P4 (8 programas, 96-97 %) | x3,2-4,0 | CPU (G1-a hecho o no) | 25-30 (lo limita el GS) | 25-30 |
+| H3 | P5 + P6 + G1-a | x5,5-8,5 | CPU con G1-a: 30-40 **[H]** | 30-40 | 30-40 |
+| H3' | H3 + G2 v1 | x5,5-8,5 | GPU (≤10 ms **[H]**) | 44-55 (lo limita el EE) | 44-50 |
+| **H4 = 60** | T1 + G2 v2 + L1 o I1 | x5,5-8,5 en su hilo | GPU | **60-80** | **60** |
+| **H5 = 120** | P7 + E1 + I1 + G2 v2 ≤6 ms | x12-15 | GPU | **100-140 [H fuerte]** | **120** (o 100-120 en escenas pesadas) |
+
+### 0.5 GS en GPU (D2 y G2): diseno razonado
+**Interfaz**: el runtime ya separa el frontend (`gs_frontend.cpp`: GIF, registros, armado de primitivas) del backend
+(`GSRasterBackend` en `gs_backend.h`: `Submit(GSPrimitiveBatch)`, `LoadClut`, `BeginTransfer`/`UploadImage`, `Flush`,
+`TextureFlush`, `Sync`, `Present`, `ClearFramebuffer`, `ConsumeLocalToHostBytes`, `ReadVram`/`WriteVram`, `SnapshotVram`).
+`GSCpuBackend` (3 053 lineas) es una implementacion y `GSThreadedBackend` la pone detras de una cola. El backend de GPU es **otra
+implementacion de `GSRasterBackend`** detras de la misma cola, elegida con una variable (`PS2X_GS_BACKEND=metal`), sin tocar el
+frontend. El de CPU no se retira: es la referencia y el respaldo.
+
+**Que se queda en la CPU**: el frontend entero (GIF, PATH1/2/3, registros, PRIM, armado de vertices), la cola del hilo del GS, las
+transferencias host→local (se copian al buffer compartido), `ReadVram`/`SnapshotVram`/local→host (leen el buffer tras esperar a la
+GPU) y, en la v1, la presentacion (`PresentFromLocalMemory` leyendo el buffer compartido: 640x512 son <1 ms). Ventaja del M1: la
+memoria es unificada, asi que la VRAM del GS puede ser un `MTLBuffer` en `storageModeShared` que la CPU lee sin copia una vez
+terminada la GPU.
+
+**Modelo de GPU recomendado [H, lo decide D2]**: la VRAM de 4 MB **como buffer con el swizzle nativo del GS**, no como cache de
+texturas del host (el estilo del renderizador HW de PCSX2). Rasterizado por **tiles en compute**: cada tile de pantalla (32x32)
+es un threadgroup que recorre sus primitivas **en orden** y hace en el shader lo que hace `GSCpuBackend` (direccionamiento por PSM,
+muestreo, CLUT, mezcla, Z, pruebas), con aritmetica entera donde la CPU es entera. Es la traduccion directa de las bandas de la CPU
+a la GPU y es lo unico que permite igualar bit a bit a la referencia. El estilo "cache de render targets" es mas rapido de
+arrancar pero no reproduce el aliasing y no se puede comparar con hashes.
+
+**Estado del GS a reproducir** (la referencia es lo que hace `gs_cpu_backend.cpp`, no la PS2; G0/M0-e dicen que usa de verdad
+AirBlade y eso se hace primero):
+- **Primitivas**: punto, linea, tira de lineas, triangulo, tira, abanico, sprite; IIP (Gouraud/plano), FST (UV frente a STQ con
+  perspectiva), XYOFFSET, SCISSOR; reglas de cobertura y de arriba-izquierda iguales a `DrawTriangle`.
+- **Texturas**: TEX0 (TBP/TBW/PSM/TW/TH/TCC/TFX: modulate, decal, highlight, highlight2), formatos PSMCT32/24/16/16S y PSMT8/4/8H/4HL/4HH
+  con su swizzle; CLUT (CBP/CPSM/CSM/CSA/CLD, cargada en `LoadClut` con la semantica de CLD), TEXA (TA0/TA1/AEM), CLAMP (repeat,
+  clamp, region), TEX1 (filtro y MIP: solo lo que implemente `sampleT`), `TextureFlush`.
+- **Pixel**: ALPHA (A/B/C/D/FIX), PABE, COLCLAMP, **FBA** (bit alto del alfa forzado), **dithering** (DTHE/DIMX, en PSM de 16 bits),
+  FOG/FOGCOL, TEST (ATE/ATST/AREF/AFAIL, DATE/DATM, ZTE/ZTST), ZBUF (ZBP/PSM/ZMSK, Z de 32/24/16), FRAME (FBP/FBW/PSM/FBMSK).
+- **Memoria**: transferencias host→local y local→local (BITBLTBUF/TRXPOS/TRXREG/TRXDIR), local→host, `ClearFramebuffer`.
+- **Aliasing "textura solapa destino"**: el caso que hoy fuerza la serie. En el modelo por tiles, una primitiva que lee texeles
+  escritos por primitivas anteriores **de otro tile** necesita una barrera (fin de pasada). Con 8 000 por VSync, una barrera por
+  primitiva serian 8 000 pasadas: inviable. Regla: (1) G0 mide cuantas son solape real (rectangulo UV leido frente a rectangulo
+  XY escrito, en paginas del GS) y cuantas son falsos positivos de la prueba conservadora actual; (2) las que leen solo de su propio
+  tile, o de una zona que nadie escribe dentro del lote, van sin barrera; (3) las consecutivas que leen la misma zona fuente se
+  agrupan en una sola pasada. **[H: si la mayoria son copias de un buffer a otro sitio (bloom, sombra, reduccion), quedan unas
+  decenas de pasadas por VSync; si son realimentacion pixel a pixel, la GPU pierde mucho]**. G1-a aplica la misma regla en la CPU.
+- **Presentacion**: PMODE, DISPFB1/2, DISPLAY1/2 y la mezcla de circuitos, como hoy (en la v1 lo sigue haciendo la CPU).
+
+**Reaprovechar en vez de escribir (D2)** **[H, a comprobar en D2]**: (a) **paraLLEl-GS** (rasterizador del GS en compute de
+Vulkan, pensado para igualar al GS por software y con seguimiento de riesgos de realimentacion; corre en PCSX2): via MoltenVK en
+Mac; hay que confirmar licencia, que MoltenVK soporta lo que usa y el coste de alimentarlo desde nuestro frontend; (b) el renderizador
+HW de PCSX2: GPL-3 y no exacto, descartado salvo como consulta; (c) backends de Play! (BSD): estilo HW, no exactos. D2 es un
+prototipo de 1-2 sesiones (Opus): alimentar la opcion (a) con una captura de `PS2X_GS_BENCH` y comparar con la CPU, frente al
+coste estimado del Metal propio. Si (a) no cuadra, Metal propio.
+
+**Verificacion** (la GPU no puede romper el modo determinista ni la referencia):
+1. **Banco del GS sin juego**: `PS2X_GS_BENCH` ya graba las ordenes del hilo del GS y la VRAM de partida. Se anade un modo de
+   repeticion que ejecuta la misma captura en los dos backends y compara, **tras cada Present**, la VRAM entera y la imagen
+   presentada. Es el equivalente de `BLADE_VU1_DIFF` para el GS: no hace falta EE ni VU1, ~segundos por captura, y se puede
+   bisecar hasta la primera primitiva distinta (comparando tras cada `Submit` en el modo de depuracion).
+2. **Criterio**: objetivo **bit a bit** en la VRAM (hash identico) para las rutas enteras; donde no se pueda (interpolacion en
+   coma flotante del shader frente a la de la CPU), tolerancia declarada por funcion: % de pixeles distintos, diferencia maxima por
+   canal (≤1-2) y PSNR ≥45 dB, mas un **hash tolerante** (imagen reducida y cuantizada, p. ej. 4 bits por canal tras 2x2) para que
+   el modo determinista tenga algo comparable. Shaders compilados sin matematica rapida (`MTLMathModeSafe`).
+3. **Modo determinista**: con el backend GPU, `qa_regression.sh` tiene que dar los **hashes de RAM identicos** (el GS no escribe la
+   RAM del EE salvo local→host y CSR/SIGNAL/FINISH, que salen del frontend) y PNG dentro de la tolerancia frente a los de la CPU.
+   En ese modo se espera a la GPU en cada Present.
+4. **A ojo**: los ticks 100, 900, 3100 y 3160 en `qa_out/` (CPU frente a GPU) y, si difieren, PCSX2.
+
+**Coste [H]**: D2 1-2 sesiones (Opus). G2 v1 (exacta, triangulos/sprites, 32 bits y paletas de 8/4, mezcla, Z, scissor, FBA,
+dithering, transferencias, barreras por solape, sin optimizar): **8-15 sesiones** de Opus mas **4-8** de Sonnet (un formato o una
+funcion por tarea, con el banco como criterio). G2 v2 (lotes por estado, menos pasadas, presentacion en GPU sin pasar por la CPU,
+≤6 ms/V): 3-6 sesiones. Si D2 elige paraLLEl-GS: v1 en 5-10 sesiones **[H]**. Sin G2, 60 no se alcanza.
+
+### 0.6 VU1 para 60 y 120 (cambios sobre §2-§3)
+- **Orden**: P1-P6 igual. **P4 cubre el corpus de 5 escenas** (`work/vu1gen/corpus/e1-e5.rec`), no solo `nivel.rec`, y P6 compila
+  **todo el contenido visto** (los 72 de la union y los que salgan del menu y de los niveles 2+) con el interprete de respaldo y
+  `BLADE_VU1_MISS`. El objetivo de P6 pasa de "<0,5 % de ciclos interpretados" a medirlo **por escena** con leave-one-out: hoy, con 4
+  escenas de entrenamiento, la que falta queda al 86-100 %, y por Amdahl (§1.4) un 10 % interpretado limita el VU1 a ~x5.
+- **Si la cola sigue alta tras P6** (escenas de niveles 2+ con >5 % interpretado): opcion 1, generar desde las **imagenes de 16 KB
+  subidas** (desensamblado estatico de todo lo alcanzable desde las entradas, no solo lo ejecutado; las imagenes se pueden sacar
+  de las grabaciones o del disco) **[H: el CFG estatico de los programas por objeto puede tener saltos indirectos sin resolver]**;
+  opcion 2, cache AOT persistente en disco: lo que falla en una partida se genera fuera de linea y se usa en la siguiente; opcion 3
+  (la cara), JIT con `MAP_JIT`. Se decide con datos de niveles 2+ (Pendiente 7 del ADR).
+- **T1 sube al camino de 60** (0.2). Con G2 hecho, los nucleos P los liberan las bandas del GS.
+- **P7 (nuevo, para 120; Opus)**: NEON de verdad con el mix del histograma. `MADDbc`/`MADDAbc`/`MULAbc` → `fmul` por elemento
+  (`v.s[i]`) + `fadd` (D1: sin fusionar); `dest` parcial → `bsl`; LQ/SQ/SQI → `ldr q`/`str q` sin normalizar mas que lo marcado;
+  **control por bloque**: cada FMAC del bloque hace un OR de una mascara "exponente fuera de [64,190] o resultado fuera de
+  [26,253]" (2-3 instrucciones) y al final del bloque, si la mascara no es cero, se restaura el estado de entrada del bloque y se
+  repite por la ruta exacta (el estado son locales; los `SQ` del bloque van a un buffer y solo se publican al confirmar) **[H]**;
+  MAC/estado solo donde la liveness de P5 lo pida; probar `FPCR.FZ` para el vaciado de denormales si da los mismos bits que
+  `normalizeFmacResult` **[H]**. Criterio: corpus en 0 diferencias con `EXIT`/`FUZZ` (la mutacion de P3 fuerza la repeticion de
+  bloques) y replay **x12** o mas frente al interprete.
+- **VU1 en varios hilos**: sigue descartado (cadena secuencial, §1.3).
+
+### 0.7 Tiempo del juego: 60 en pantalla
+**Comprobado otra vez en `work/output_orig`** (recompilado, leido para esta revision):
+- `0x132D10`: lee el contador del VBlank `[gp-0x7CE0]` en `0x132E30`, hace 1-4 pasos y despues dibuja una vez (`jal 0x12EB30`,
+  `0x16B040`, `0x12EC80` en `0x1330D8`-`0x1330EC`). El VBlank `0x133CB0` solo suma 1.
+- Cada paso: `dt = 0,02 x [0x70003FAC]` (`0x132E70`-`0x132E84`), guardado en `0x2FA558` y copiado a `0x70003FA8`; reloj escalado
+  `[0x70003FB0] += dt`, **reloj sin escalar `[0x70003FB4] += 0,02` (literal, `0x132FFC`-`0x133028`)**; llama a `0x174CD0`, al
+  objeto de `0x70003FCC` (`jalr`), a `0x132350`, `0x2393B0` y `0x247F10`.
+- **Quien usa `dt`**: 53 funciones leen `[0x70003FA8]` (dt), 71 leen el reloj escalado `0x70003FB0` y 8 el sin escalar `0x70003FB4`.
+- **Quien no lo usa**: **9 funciones fuera del bucle construyen el literal 0,02** (0x3CA3D70A): acumuladores `+= 0,02` en
+  `0x174CD0` (llamada en cada paso) y `0x1A3AC0`, productos `x 0,02` en `0x143E00`, `0x1446F0`, `0x171920`, y otros usos en
+  `0x178800`, `0x1A4C60`, `0x25CB90`, `0x25EA30`; y **13 funciones construyen 50,0** (0x42480000; `0x127740`, `0x1334B0`, `0x167400`,
+  `0x22FC20`, ... **[H: no todas tienen por que ser tiempo]**). Ademas `[0x70003FAC]` (la escala) **la escribe el propio juego** en
+  `0x167860`, `0x1685F0`, `0x168200` y `0x225040` (camara lenta o pausa **[H]**). Es un recuento de texto sobre el desensamblado;
+  no he seguido los contadores enteros por paso (animaciones, IA, audio), que son la otra forma de "contar pasos".
+- **Conclusion**: la logica **no** usa `dt` en todas partes. "VBlank a 60 con dt 1/60" pide al menos cambiar los 10 literales de
+  0,02 (el del bucle y los 9), revisar los 13 de 50,0 y los contadores por paso; posible, pero no se sabe si basta **[H]**.
+
+**L0. Experimento barato y acotado (Sonnet, 1-2 sesiones; Opus revisa el resultado)**: detras de `BLADE_EXP_60HZ=1` (sin cambiar
+el modo por defecto ni las referencias):
+1. VBlank del EE a 60 Hz (`kVBlankPeriod` de NTSC, que ya existio) y `dt` a 1/60 cambiando el literal de `0x132E74/78` y el de
+   `0x132FFC/0x133008` (0x3C888889) con parches de instruccion de PS2Recomp (TOML), no editando el codigo generado.
+2. **Variante A**: solo esos dos. **Variante B**: tambien los 9 literales de 0,02 a 1/60 y los 50,0 que sean tiempo a 60,0.
+3. Medidas, con el mismo guion en tiempo de juego (los ticks del guion x1,2): (a) el cronometro del HUD: 10 s de juego en 600
+   VSync; (b) la posicion del jugador (RAM de su `RwFrame`) a los mismos segundos de juego que una corrida a 50 Hz, en el tramo
+   2600-3900 → diferencia ≤1-2 %; (c) la musica y los efectos frente a la imagen; (d) un video lado a lado con PCSX2 para ver
+   animaciones, IA y particulas; (e) una sonda que cuente por paso las llamadas a las 9 funciones del literal (cuales corren en
+   la partida).
+4. **Regla de decision**: si la variante A o B pasa (a)-(d) sin nada a 1,2x ni a 0,83x → **L1 = 60 nativo con dt** (2-4 sesiones
+   para dejarlo limpio, opcional por variable, con referencias propias del modo determinista). Si falla algo que no se explica con
+   un literal mas → **I1 = interpolacion**. Coste del experimento: 1-2 sesiones; no toca la ruta por defecto.
+
+**I1. Interpolacion del dibujo (Opus; obligatoria para 120)**. La logica sigue a 50 pasos/s; se dibuja a 60/120 con el estado
+interpolado entre los dos ultimos pasos (`alfa` = fraccion del paso). Detalle de §4.2 (sigue valido), con lo que hay que interpolar:
+- **Camara**: la matriz del `RwFrame` de la `RwCamera` (y la vista que se sube al VU1): posicion en lineal, orientacion con slerp de
+  cuaterniones.
+- **Entidades**: los `RwFrame` (y sus LTM) de jugador, tabla, peatones y vehiculos; los objetos estaticos no cambian.
+- **Huesos**: la paleta de matrices del esqueleto (RpHAnim/RpSkin) **[H: hay que localizarla]**: mejor interpolar el tiempo del
+  interpolador de animacion que cada matriz.
+- **No se interpola**: HUD/UI (2D, se dibuja con el estado del ultimo paso), particulas al principio (se dibujan en el ultimo paso).
+- **Riesgos**: teletransportes y reapariciones (salto grande de posicion → sin interpolar ese fotograma), **cortes de camara** (salto
+  de posicion/orientacion por encima de un umbral, o el evento del juego si se encuentra → se ajusta sin mezclar), UI dibujada dos
+  veces si el dibujo tiene efectos, y sobre todo **efectos de logica dentro del dibujo** (particulas que avanzan, animaciones que
+  se actualizan en el render, el contador de la cola de sky2 `gp-0x7EE8`, numeros aleatorios).
+- **I0 (prueba previa, Sonnet, 1 sesion)**: en modo determinista, llamar a la secuencia de dibujo dos veces con el mismo estado de
+  logica y comparar la RAM (salvo los buffers de dibujo conocidos). Si cambia algo, la lista de lo que cambia es la lista de
+  efectos de logica del dibujo. Decide cuanto cuesta I1 antes de empezarlo.
+- **Coste [H]**: I0 1 sesion; I1 6-12 sesiones de Opus (ingenieria inversa de las listas de `RwFrame` y del esqueleto) + 2-4 de
+  Sonnet (umbrales y comprobaciones). Verificacion: a 50 Hz con `alfa = 1` siempre, el modo determinista da los mismos hashes que
+  sin I1; a 120, a ojo y contra PCSX2 a 50.
+
+### 0.8 Estimacion honesta (rangos, en sesiones de trabajo de un agente)
+| Paso | Sesiones | Quien | Ganancia | Hipotesis que lo rompe |
+|---|---|---|---|---|
+| D1 (en curso) + M0-a | 1 + 0,5 | Opus / Sonnet | 0 (-1-3 %) | — |
+| M0-e | 1 | Sonnet | 0 | — |
+| P1-P6 | 14-28 | Opus + Sonnet | VU1 x5,5-8,5 | coste por par de clang (15-40 instrucciones) |
+| G0 + G1-a | 2-4 | Sonnet (+Opus) | GS CPU 30 → 30-40 V/s **[H]** | que las 8 000 sean solape real |
+| D2 + G2 v1 + v2 | 15-30 (5-10 menos si sirve paraLLEl-GS) | Opus + Sonnet | GS ≤6-10 ms | barreras por solape; exactitud del shader |
+| T1 | 4-8 | Opus | fotograma = max(EE, VU1) | carreras, orden del GIF, 4 nucleos P |
+| L0 + L1 | 3-6 | Sonnet + Opus | 60 en pantalla | literales y contadores por paso |
+| (o) I0 + I1 | 9-17 | Opus + Sonnet | 60/120 en pantalla | efectos de logica en el dibujo |
+| P7 | 4-8 | Opus | VU1 x12-15 | control por bloque con `SQ` diferidos **[H]** |
+| E1 | 3-10 | Opus + Sonnet | dibujo del EE ≤7 ms | lo que mida M0-e |
+**Acumulado hacia 60**: D1 + M0 + P1-P6 + T1 + G0-G2 + L (L0+L1, o I0+I1) = **~40-90 sesiones de trabajo, camino critico ~25-55**
+(la via del GS va en paralelo con la del VU1). La cifra baja supone que L1 sirve y que el VU1 da x7+. **Hacia 120**: + P7 + E1 + I1 +
+G2 v2 ≤6 ms = **~55-110 sesiones, camino critico ~40-70**. Las cifras de V/s de 0.4 por encima de H3 son hipotesis: nada de G2, T1,
+P7 ni I1 esta medido.
+**Las 3 incognitas que mas cambian el plan**:
+1. **Instrucciones de la CPU por par del VU1 compiladas** (hoy ~150 por ciclo): x6 frente a x12 decide si 60 sale sin T1 y si 120
+   es posible. Se mide en P2 (primer programa) y P5.
+2. **Que son las ~8 000 primitivas serie por VSync** (solape real o falso positivo; copias de buffer o realimentacion): decide el
+   techo de G1-a en CPU, el numero de barreras de G2 y si la GPU baja de 6 ms. Se mide en G0 (barato, 1 sesion).
+3. **Si la logica aguanta `dt` 1/60** (10 literales de 0,02, 13 de 50,0, la escala escrita por el juego, contadores por paso) y, si
+   no, cuantos efectos de logica tiene el dibujo (I0): decide si 60 cuesta 3-6 sesiones o 9-17. Se mide en L0 e I0.
+(Cuarta: cuanto de R es dibujo, M0-e; solo importa para 120.)
+
+### 0.9 Pasos nuevos en detalle
+- **M0-e (Sonnet)**: (1) con `sample` del hilo EE en el nivel 1 (VU1_GEN o interprete, da igual), separar el tiempo de los pasos
+  de logica (bajo `0x132E70`-`0x1330B8`) del de dibujo (bajo `0x12EB30`/`0x16B040`/`0x12EC80`) y del desempaquetado del VIF1,
+  restando el VU1; (2) un histograma del estado del GS por primitiva en una captura de `PS2X_GS_BENCH`: tipos de PRIM, PSM de
+  FRAME/ZBUF/TEX0, TFX, ALPHA, TEST, FBA, DTHE, FOG, filtros de TEX1, CLAMP, y transferencias por direccion. Criterio: el reparto
+  suma el 100 % del hilo EE ±5 %; el histograma cuenta todas las primitivas de la captura. Riesgo: bajo.
+- **G0 (Sonnet)**: sobre la captura de `PS2X_GS_BENCH` (ticks ~3043-3140 y la de la entrada al nivel), para cada primitiva que va
+  en serie por "textura solapa destino": tipo, tamano en pixeles, rectangulo UV leido y XY escrito en paginas/bloques del GS, PSM
+  de los dos, y si el solape es real (algun bloque leido se escribe en la misma pasada) o solo de rango de TBP. Agrupar por estado
+  (es probable que sean pocos efectos: sombra, reflejos, post-proceso **[H]**). Criterio: la suma da las ~8 000/VSync de M0-b.
+- **G1-a (Sonnet; Opus si hay diferencias)**: cambiar la prueba de solape del rasterizador de CPU por la exacta de G0 (por bloques
+  leidos frente a escritos). Verificacion: `PS2X_GS_AB=1` en 0 en una corrida completa, `qa_regression.sh` identico (la imagen no
+  puede cambiar), y los ms/V del banco aislado antes y despues. Si una primitiva se mueve de serie a paralelo y cambia un pixel, la
+  prueba esta mal: se para.
+- **E1 (Opus + Sonnet)**: segun M0-e. Candidatos **[H]**: la espera de RenderWare `0x1DF500` (ya tiene override), el desempaquetado
+  del VIF1 (sale del hilo con T1), funciones calientes del codigo recompilado del EE con overrides nativos verificados con el modo
+  determinista.
+
+### 0.10 Quien hace que, y briefs reutilizables para Sonnet
+Regla (igual que §3): **Opus** para diseno, decisiones (D1, D2, L1/I1) y depuracion sin criterio cerrado (P1, P2, P5, P7, G2 v1,
+T1, I1); **Sonnet** para lo acotado y verificable con un banco o una medida (M0-a, M0-e, G0, G1-a, P3, P4, P6, subtareas de G2,
+L0, I0), con la orden de **parar y escalar** ante la primera diferencia que no entienda.
+
+**Brief base (todas las tareas de Sonnet)**: "Recomp de AirBlade en `~/airblade-recomp`, rama main (es la RECOMP, no el decomp
+`~/airblade-decomp`: no lo toques). Arranque: `manage_adr get Users-home-airblade-recomp`, `git log -5`, `git status`; lee
+`docs/PERFORMANCE_BASELINE.md` (seccion M0) y `docs/PERFORMANCE_PLAN.md` §0 y el paso `<ID>`. Tarea unica: `<texto del paso>`. Reglas:
+los cambios del runtime van como parche en `patches/` y pasan `scripts/check_patches.sh`; el runner en `runner/`; no edites el
+codigo generado ni las cabeceras; no limpies `build/blade` (ni `build/gpu`) ni pares compilaciones ajenas; una corrida a la vez con
+load average <3; no cambies el modo por defecto (todo detras de una variable). Criterio de aceptacion: `<criterio del paso>`. Si algo
+no cuadra o aparece una diferencia que no entiendes, para y dilo con las 5 primeras diferencias: no la tapes. Entrega: tabla de cifras
+con comando, commit y load average, y las rutas de los artefactos; commit solo de tus ficheros, sin coautor ni mencion de IA, sin
+push. Responde en espanol."
+Lineas de tarea para el brief base:
+- **M0-a**: "regenerar `qa/ref_det` con el build de D1; criterio: dos corridas deterministas identicas y el commit de la referencia
+  anotado en un fichero de texto".
+- **M0-e**: el texto de 0.9; criterio de 0.9.
+- **G0**: el texto de 0.9; "trabaja sobre las capturas de `PS2X_GS_BENCH`, sin cambiar el rasterizador".
+- **G1-a**: el texto de 0.9; criterio `PS2X_GS_AB=1` en 0, `qa_regression.sh` identico y ms/V del banco aislado.
+- **P3, P4, P6**: los briefs de §3 (siguen validos), con el corpus `work/vu1gen/corpus/e1-e5.rec` ademas de `nivel.rec`.
+- **G2-sub (una por formato o funcion)**: "implementar en el backend de GPU `<PSM o funcion: PSMT4 con CLUT CSM1, ALPHA, DATE...>`
+  copiando la semantica de `gs_cpu_backend.cpp`; criterio: banco del GS (repeticion de capturas en los dos backends) con VRAM
+  identica en todas las capturas que usan esa funcion, o dentro de la tolerancia declarada en 0.5 si es una ruta de coma flotante;
+  no toques el frontend ni el backend de CPU; worktree y build propios".
+- **L0**: el texto de 0.7 (variantes A y B, medidas (a)-(e)); "no decides L1/I1: entregas la tabla y la decides Opus".
+- **I0**: el texto de 0.7; "entrega la lista de direcciones de RAM que cambian entre las dos llamadas al dibujo, agrupadas por
+  funcion que las escribe".
+
+---
+
+## Resumen original (a1eedd5; sustituido por el de arriba el 2026-11-12, se conserva como historia)
 1. En el nivel 1 el fotograma dura 87,8 ms: ~83 ms son VU1 (~46 ns por ciclo del VU1) y ~5-7 ms el resto del EE. Para 50 V/s el VU1 tiene que bajar a ~13 ms: **x6,5**.
 2. El coste esta en lo que cuesta cada ciclo, no en cuantos hay ni en cuantas llamadas: el gasto fijo por llamada es <1 % y solo el 0,5 % de las llamadas repite entrada (lo he medido en `nivel.rec`), asi que no hay cache posible.
 3. **El GS no aguanta 50 tal cual [H fuerte]**: el hilo del rasterizador gasta 23-29 ms por fotograma (26,5 % a 11,4 V/s; 42,5 % a 14,6). Su techo ronda 34-43 V/s. Primero hay que medirlo (M0-b).
@@ -37,6 +341,8 @@ Lo que manda es el hilo mas cargado: fotograma = max(EE, rasterizador, bandas), 
 - **VU1**: 83 ms a ≤13-15 ms (20 menos 5-7 del resto del EE): **x5,5-6,4**. El README dice x6,5 con el resto a 7 ms, y cuadra.
 - **Resto del EE**: no es el cuello mientras el VU1 vaya en el mismo hilo. Con 5-7 ms cabe en 20 ms; para 60 V/s (16,7 ms) ya obliga a x8,6 en el VU1 o a mover el VU1 a otro hilo (seccion 4).
 - **GS**: el hilo del rasterizador necesita 23-29 ms por fotograma, mas que los 20 ms. **Si las cifras de `sample` son trabajo de verdad, el GS por CPU se queda en 34-43 V/s.** Lo confirman por otro lado las medidas de dev 2: en modo determinista `SubmitMany` ocupaba 102 s de pared en una corrida de 116 s (88 %) que iba a 34 V/s de media, y en tiempo real la partida no paso de 32 V/s. Hace falta x1,2-1,5 en el hilo del rasterizador para 50, x1,4-1,8 para 60 y x3-4 para 120. Que "el GS va holgado" (BASELINE) solo vale a 11-15 V/s.
+  **[2026-11-12, M0-b]**: medido. GS aislado 23-30 V/s, en vivo 38, escena pesada 21; ~28 ms/V serie. El techo real es ~30 V/s,
+  peor que los 34-43 de arriba, y con CPU no se llega a 60 (ver §0.1-0.2).
 - **Margen del M1**: tiene 4 nucleos de rendimiento y 4 de eficiencia (comprobado: `hw.perflevel0/1.physicalcpu` = 4/4). EE, rasterizador, 3 bandas y el hilo principal ya son 6 hilos con trabajo. Un hilo mas para el VU1 caeria en un nucleo de eficiencia (~1/3 de velocidad) salvo que se ajuste la QoS o se quite una banda. Esto hay que medirlo, no suponerlo.
 
 ### 1.3 Coste por ciclo frente a numero de ciclos y de llamadas
@@ -123,6 +429,10 @@ Hay que reproducir **la semantica del interprete**, no la del IEEE del host:
 ---
 
 ## 3. Orden de trabajo
+
+**[2026-11-12]** El orden de esta seccion queda sustituido por §0.3 (meta 60/120). Estado: M0-b, M0-c y M0-d (parcial) hechos
+(d2044e4); M0-a pendiente de D1; **D1 en curso** (otro agente); G1 sustituido por G1-a + G2 (§0.5, §0.9). Los pasos P1-P6 y T1 y sus
+briefs siguen validos.
 
 Reglas para todos los pasos (las del ADR): los cambios del runtime van como parche en `patches/` y se comprueban con
 `scripts/check_patches.sh`; el runner va en `runner/`; no se limpia `build/blade`; el codigo generado no se versiona; commits sin
@@ -222,6 +532,9 @@ compilado **identico** a la referencia del interprete (D1) en los 78 puntos; cic
 0,5 % (`BLADE_VU1_MISS`); V/s medidos (2 corridas). Ganancia: +5-15 % sobre P5 (la cola). Riesgo: bajo.
 
 ### G1. GS por CPU para 50 (Opus para el diagnostico, Sonnet para los micro-pasos) — antes de P6 si M0-b da menos de 50
+**[2026-11-12, obsoleto en parte]**: M0-b descarto "mas bandas" (8 bandas = 4 bandas) y mostro que la parte serie (~28 ms/V) no
+baja con NEON en las funciones de pixel. Queda solo la comprobacion de solape exacta como **G1-a** (§0.9); el NEON del rasterizador
+de CPU se aparca, porque la via para 60/120 es G2 (GPU) y la CPU queda como referencia.
 Que cambia: segun M0-b. Opciones, de barata a cara: mas bandas o distinta QoS de los hilos (4P+4E); bajar la parte en serie
 (las 84 000 primitivas cuya textura lee el destino y las 79 000 con FRAME/ZBUF solapados que dev 2 media en serie);
 `sampleT`/`DrawTriangle`/`WritePixelFast` con NEON. Criterio por micro-paso: `PS2X_GS_AB=1` con 0 diferencias en una corrida
@@ -267,6 +580,8 @@ PCSX2). Juega a velocidad real, pero no da mas fluidez.
   con constantes por paso) **[H, probablemente no]**. Prueba barata (Sonnet, sin cambiar codigo del juego en el repo: un
   override de prueba en `runner/` detras de una variable): cronometro del HUD (10 s reales en 600 VSync), recorrido del jugador
   con el mismo guion frente a PCSX2 y duracion de la musica. Si algo va a 1,2x, se descarta.
+  **[2026-11-12]**: comprobado que no toda la logica usa `dt` (9 funciones mas con el literal 0,02, 13 con 50,0, reloj sin escalar
+  con literal; §0.7). La prueba queda concretada como L0 (§0.7), con parches de instruccion en vez de un override.
 - **Interpolacion del dibujo (la buena para 60/120) [H, investigacion de Opus]**: la logica sigue a 50 Hz y se dibuja a 60/120 con
   el estado interpolado entre el paso anterior y el actual. En RenderWare, las transformaciones de camara y objetos estan en las
   matrices de los `RwFrame` (y sus LTM), en RAM. Haria falta: (1) localizar la lista de `RwFrame` y camaras vivas; (2) guardar
@@ -284,6 +599,9 @@ PCSX2). Juega a velocidad real, pero no da mas fluidez.
   60. Es un backend nuevo que convive con el de CPU, que sigue siendo la referencia: `qa_regression.sh` compara la RAM bit a bit y
   las imagenes del backend de CPU, y la GPU necesita su propia validacion por imagen con tolerancias (PSNR), sin hashes. Costo:
   semanas. **No** va antes de que el VU1 deje de ser el cuello: hoy cambiaria 0 V/s.
+- **[2026-11-12, sustituido]**: con el techo del GS por CPU en ~30 V/s y la meta en 60/120, el GS en GPU pasa a hito temprano
+  (G2, §0.5) en una via paralela a la del VU1: hoy no cambia los V/s, pero es el paso mas largo hacia 60 y no comparte ficheros con
+  el VU1. La validacion por imagen con tolerancias se concreta en §0.5 (banco de capturas, bit a bit donde se pueda).
 
 ---
 
@@ -300,6 +618,11 @@ PCSX2). Juega a velocidad real, pero no da mas fluidez.
 | Hilos en nucleos de eficiencia (M1 4P+4E) | `sample` por hilo y QoS | ajustar el numero de bandas y la QoS antes de anadir T1 |
 | Medidas con la maquina cargada | load average en cada fila | repetir; no comparar corridas con carga distinta |
 | Romper el modo determinista | `qa_regression.sh` tras cada paso que toque el runtime | el compilado tiene que dar los mismos hashes que el interprete; T1 con barrera |
+| (2026-11-12) GS en GPU distinto de la CPU | banco de capturas `PS2X_GS_BENCH` en los dos backends | bit a bit en VRAM donde sea entero; tolerancia declarada y hash tolerante si no; CPU como respaldo |
+| (2026-11-12) Barreras por "textura solapa destino" en GPU | G0 | prueba de solape exacta (G1-a); agrupar las que leen la misma fuente |
+| (2026-11-12) Logica que no usa `dt` (literales 0,02/50,0, contadores por paso) | L0 | interpolacion (I1) si L0 falla |
+| (2026-11-12) Dibujo con efectos de logica (interpolacion) | I0 | lista de efectos antes de I1; `alfa = 1` da los mismos hashes |
+| (2026-11-12) Dos vias en paralelo pisandose | ADR: un agente por build | worktree y `build/gpu` propios para la via del GS |
 
 Cadena de regresion por paso (de barata a cara): (1) `BLADE_VU1_DIFF` del programa tocado, ~6 s por fichero; (2) corpus
 completo con `EXIT` y `FUZZ`, ~2 min; (3) `scripts/check_patches.sh`; (4) `scripts/qa_regression.sh` identico frente a
@@ -308,6 +631,9 @@ completo con `EXIT` y `FUZZ`, ~2 min; (3) `scripts/check_patches.sh`; (4) `scrip
 ---
 
 ## 6. Estimaciones (rangos; V/s del nivel 1, tramo 2600-3900)
+**[2026-11-12]** Sustituidas por §0.4 (hitos) y §0.8 (sesiones e incognitas). Lo que M0 cambia aqui: G = 33-44 ms/V aislado (no
+23-29), asi que la columna "con el techo del GS sin G1" baja a 23-30 V/s desde P4; "120 no es alcanzable con este plan" pasa a ser
+el hito H5 con P7, E1, I1 y G2.
 Modelo: fotograma = max(R + 83/s_VU1, G), con R = 5-7 ms (resto del EE) y G = 23-29 ms (rasterizador, **sin medir bien: M0-b**).
 | Paso | Ganancia en el VU1 (acumulada, sobre el interprete) | V/s esperados si el GS no limita | Con el techo del GS sin G1 | Esfuerzo |
 |---|---|---|---|---|
@@ -354,6 +680,13 @@ la diferencia entre x4 y x9) y el techo real del GS. Las dos cosas se miden pron
 - **`work/output_orig`**: manejadores de VBlank `0x133CB0` (contador `gp-0x7CE0`), `0x16B010` (llama a `0x10AC18`, sin identificar) y `0x25D540` (lee `GS CSR` 0x12001000; driver de imagen). Bucle
   principal `0x132D10` con 1-4 pasos de `dt = 0,02 x [0x70003FAC]` y un solo dibujo (§4.1).
 - **CPU**: Apple M1, 4 nucleos de rendimiento y 4 de eficiencia.
+- **(2026-11-12, revision) `work/output_orig`, recuento de texto sobre el desensamblado comentado**: lectores de `[0x70003FA8]` (dt)
+  53 funciones, de `0x70003FB0` 71, de `0x70003FB4` 8; `lui 0x3CA3` + `ori 0xD70A` (0,02) en 10 funciones (el bucle y 9 mas);
+  `lui 0x4248` (50,0) en 13; escritores de `[0x70003FAC]` 4 funciones. Reloj sin escalar `[0x70003FB4] += 0,02` en el propio paso.
+  No es un analisis de flujo: un mismo literal puede no ser tiempo, y los contadores enteros por paso no estan contados.
+- **(2026-11-12, revision) Interfaz del GS**: `GSRasterBackend` (`include/runtime/gs/gs_backend.h`) con `GSCpuBackend` y
+  `GSThreadedBackend` como implementaciones; `GSPrimitiveBatch` = 3 vertices + `GSDrawState` por primitiva; `GSContext` lleva FRAME,
+  SCISSOR, TEX0, XYOFFSET, ZBUF, TEX1, MIPTBP1/2, CLAMP, ALPHA, TEST y FBA. No hay ningun backend de GPU en el runtime.
 - **Sin comprobar** (y por eso con [H] arriba): que el tiempo del hilo del rasterizador sea trabajo y no espera, que las
   reanudaciones dependan entre si en todos los casos, cuantos VF vivos tiene cada programa, si la logica usa `dt` en todas partes,
   y que significa `[0x70003FAC]`.

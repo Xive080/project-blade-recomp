@@ -158,3 +158,86 @@ Pruebas hechas (30 000 llamadas del nivel 1, ~6 s por corrida, un solo hilo):
 - Fallo inyectado (en la salida de B, no en el compilador: prueba el comparador): vf, vi, acc, mac, status, clip, pc, cycles, mem, gif (un bit del primer paquete) y gifdrop: las 11 clases se detectan,
   salen con codigo 1 y nombran el campo, la llamada, el PC y la imagen (p. ej. `vf05.z A=47402f87 B=47402f86`, `paquete 0 distinto (byte 16; ... NLOOP=16 EOP=1 PRE=1 PRIM=05c ...)`).
 Sin verificar: un fallo real dentro de un compilador (aqui el compilado coincide, asi que no hay ninguno que detectar), imagenes y llamadas fuera de la muestra, y comparacion contra PCSX2.
+
+## M0 medir: techo del GS, corpus y histograma de pares (2026-11-12, sobre c6d6c69 + a1eedd5)
+Binario `build/blade/blade_recomp` (Release, interprete puro del VU1, `PS2X_VU1GEN_DIR` vacio), Mac arm64 de **8 nucleos logicos (4 P + 4 E)**, una sola corrida a la vez, ventana oculta, `BLADE_STATS=1`, guion de la linea base.
+Instrumentacion nueva, apagada por defecto y sin cambiar el modo normal: parche `patches/ps2recomp-zzzz-gs-bench-vu1-hist.patch` (`PS2X_GS_BENCH` en el hilo del GS y `BLADE_VU1_HIST` en el banco del VU1; la unica
+huella en el modo normal es una comparacion mas con un puntero nulo por par en el bucle del interprete). Scripts: `scripts/vu1_record_corpus.sh` y `scripts/vu1_hist_report.py`.
+
+### M0-b. Hilos del GS y techo del GS
+**Hilos**: el GS usa 1 hilo propio (`GSThreadedBackend`, el "rasterizador": recibe las ordenes del EE por una cola y reparte las primitivas) + un `BandPool` de 4 bandas por filas (por defecto `clamp(nucleos/2, 1, 4)` = 4): el propio rasterizador hace de banda 0 y hay **3 hilos de bandas**. Son **4 hilos de trabajo** (mas el EE al 100 %, el hilo principal que presenta y el audio) en 8 nucleos logicos.
+
+**Trabajo frente a espera** (`PS2X_GS_PROFILE=1`, nivel 1 2600-3900, 11,3 V/s con el perfil = igual que sin el: el contador no pesa). Por VSync, medianas de 114 intervalos (`[gsprof]` cada 2000 llamadas, restando acumulados):
+| Tramo | CPU del hilo rasterizador | CPU de las 3 bandas (suma) | tiempo de pared del rasterizador dentro de `SubmitMany` |
+|---|---|---|---|
+| 2600-3900 (todo) | 18,2 ms | 35,3 ms (11,8 por banda) | **26,4 ms** (min 21,3, max 56,3) |
+| 2600-2780 | 18,2 | 35,9 | 26,4 |
+| 2780-2870 (escena pesada) | 34,3 | 59,5 | **46,7** (36,5-56,3) |
+| 2870-3000 | 22,7 | 37,1 | 31,0 |
+| 3150-3560 | 17,5 | 34,2 | 24,9 |
+Es decir, de los 26,4 ms que el rasterizador esta ocupado por VSync, 18,2 son CPU propia (trabajo) y ~8,2 (31 %) es **espera de las bandas** (sale del bloqueo en `condition_variable::wait`, no del giro: no hay espera activa).
+Comprobacion con `sample <pid> 10` hacia los ticks 3014-3146 (7 220 muestras por hilo; la muestra encarece el GS ~25 %, asi que solo valen los reparto, no los ms): el hilo del rasterizador esta **52 % esperando trabajo** (`cvwait` de la cola, EE-limitado),
+y 46 % dentro de `SubmitMany`: 17,6 % su parte de banda 0 (`DrawRunParallel`), 13,7 % **esperando a que acaben las otras bandas**, 13,3 % **primitivas en serie** (dibujadas solo por el rasterizador con las tres bandas paradas). Las 3 bandas: 21-22 % trabajando
+(`sampleT<19>` 35 %, `DrawTriangle`/`WritePixelFast` el resto) y 78 % durmiendo. Cifras que cuadran: espera de bandas 31 % (perfil) frente a 30 % (`sample`: 991/3 346).
+Detalle del perfil por VSync (ticks 3048-3134): 209 llamadas a `SubmitMany`, 119 tramos paralelos con 41 Mpx y **~8 000 primitivas en serie** (3 Mpx, 12 ms de pared; todas por "textura solapa destino"; 0 por destino/z solapados).
+El hilo EE esta al 100 % (11,3 V/s), asi que el GS **no es el cuello hoy**: 52 % de su tiempo esta ocioso. Lo sera cuando el EE suba de ~25-35 V/s.
+
+**Prueba de techo** (GS aislado sobre las primitivas capturadas). Instrumentacion minima `PS2X_GS_BENCH=primer_Present,cuantos[,repeticiones[,paso,ventanas]]` (en `GSThreadedBackend`): desde el Present dado graba las ordenes que ejecuta el hilo del GS (con la VRAM de partida)
+y, tras `cuantos` Present, las repite N veces **en el propio hilo del GS** sobre esa VRAM, sin EE ni VU1, y mide la pared (el juego se para durante la repeticion). Se descarto repetir en el hilo que llama a Present (47-56 ms/V en vez de 35: otro hilo, otros nucleos).
+Es "el GS aislado", con el VU1 sin tocar y sin saltarse dibujos (`BLADE_RT_SKIP` solo omite un atomico, no cambia el coste del VU1 de forma util). Un Present es ~1 VSync en la partida (100 Present = 97 ticks).
+Resultados (4 bandas, repeticiones estables a +-1 %; los ticks son aproximados porque el EE esta parado durante cada repeticion):
+| Ventana (40 Present salvo la primera de 100) | primitivas por VSync | GS aislado, ms por VSync | techo del GS |
+|---|---|---|---|
+| ticks ~3043-3140 (100 Present) | 31 000 | **35,5** | **28 V/s** |
+| ~2465-2503 (entrada al nivel) | 78 700 | 44,1 | 22,7 V/s |
+| ~2693-2733 | 52 600 | 44,1 | 22,7 V/s |
+| ~2937-2977 | 38 600 | 39,3 | 25,5 V/s |
+| ~3197-3237 | 31 600 | 44,5 | 22,5 V/s |
+| ~3464-3504 | 33 100 | 33,2 | 30,2 V/s |
+| ~3687-3727 | 32 900 | 32,6 | 30,6 V/s |
+Escalado con las bandas (misma ventana 3043-3140): **1 banda 58,4 ms/V, 4 bandas 35,5, 8 bandas 34,8**. Con T(n)=s+p/n salen s~28 ms de parte que no escala (primitivas en serie, preparacion por primitiva, subidas ~1 ms, sincronizacion) y p~30 ms paralelizable: pasar de 4 a 8 hilos no gana nada,
+y con infinitas bandas el techo seria ~36 V/s. Las subidas y CLUT (resto de ordenes) son ~0,9-1,4 ms/V; las primitivas 32-43.
+
+**Techo en V/s con el criterio explicado**: techo = 1000 / (ms que necesita el GS por VSync trabajando solo, con las 4 bandas). Con el GS aislado: **23-30 V/s** segun la escena (central ~28). Con el tiempo de pared del rasterizador dentro del juego en vivo (sin perfil de CPU, sin repeticion):
+**26,4 ms de mediana = 38 V/s** (escena pesada 46,7 ms = 21 V/s). Las dos cifras NO cuadran dentro de +-15 % (35,5 frente a 26,4 ms en tramos parecidos: la repeticion es una carga sostenida de 4 hilos y puede estar limitada por reloj/termica; el vivo mide un GS que a veces descansa),
+asi que doy el intervalo: **techo del GS actual ~23-38 V/s, mejor estimacion ~30 V/s, en todo caso por debajo de 50** (confirma que G1 va antes de P6 y que el 40-55 V/s estimado en el plan depende de bajar la parte serie del GS, no de mas hilos).
+Lo que no pude medir: el techo con el VU1 realmente mas rapido (el EE es el cuello a 11-15 V/s, no hay forma de que el GS se sature sin acelerar el EE; el banco aislado lo sustituye), y variantes con 2 y 3 bandas; el efecto de la frecuencia/termica en la repeticion.
+
+### M0-c. Corpus: 5 escenas del nivel 1
+Grabadas con `scripts/vu1_record_corpus.sh` (`PS2X_VU1_RECORD=work/vu1gen/corpus/eN.rec,desde,15000`, una corrida oculta por escena, modo normal con el guion de la linea base; 15 000 llamadas = ~17 VSync, 75 MB cada una; `work/` y `*.rec` fuera de git).
+El guion llega a las 5 zonas del recorrido (el recorrido es el del guion: el jugador avanza y la camara se pega a una pared despues de ~3500, asi que e4 y e5 son zonas de poco movimiento). Banco: `BLADE_VU1_DIFF_B=interp BLADE_VU1_HIST=1 BLADE_VU1_DIFF=eN.rec`: **15 000/15 000 comparadas, 0 diferencias, 0 no reproducibles en las 5** (2,6-3,5 s cada una).
+| Escena | ticks reales | llamadas desde | microprogramas distintos (contenido ejecutado) | solo en esta escena (de las 5) | % ciclos de programas que NO salen en las otras 4 | ciclos VU1 | pares ejecutados |
+|---|---|---|---|---|---|---|---|
+| e1 | 2640-2657 | 1 100 000 | 26 | 15 | 12,4 % | 25,3 M | 20,5 M |
+| e2 | 2810-2826 | 1 300 000 | 24 | 14 | 12,3 % | 31,5 M | 27,8 M |
+| e3 | 3077-3093 | 1 550 000 | 25 | 14 | 14,1 % | 29,2 M | 24,7 M |
+| e4 | 3467-3483 | 1 850 000 | 23 | 0 | 0 % | 33,6 M | 29,9 M |
+| e5 | 3892-3908 | 2 150 000 | 23 | 0 | 0 % | 33,8 M | 30,1 M |
+Union: **72 microprogramas distintos**; salen en las 5 escenas solo 4, en 4 escenas 1, en 3 escenas 6, en 2 escenas 18, **en 1 sola 43**. Pero el peso esta concentrado: los 8 primeros de cada escena son el 96,5-97,3 % de sus ciclos, y los PC de reanudacion (r0168, r0388, r0ae0, r1810, r1cd8, r1e58, r1e98, r27b8, r2da8;
+r1ee0 en 4 escenas, r2ac0 en 2) estan en todas. Lo que cambia entre escenas es sobre todo el punto de entrada **0000** (programas por objeto, cada uno con pocas llamadas: 6-7 % de los ciclos cada uno de los dos mayores) y la ruta de ejecucion dentro de cada bucle.
+Leave-one-out: las otras 4 escenas cubren el 87,6 % (e1), 87,7 % (e2), 85,9 % (e3), 100 % (e4) y 100 % (e5) de los ciclos de la escena que falta; lo que no cubren son programas de entrada 0000 (mayores 6,8 %, 4,1 % en e1; 6,2 %, 3,8 % en e2; 6,1 %, 6,1 % en e3).
+Precaucion: la identidad del microprograma es "PC de entrada + hash de los pares que se ejecutan", asi que un mismo programa con otra ruta (otro recorte, otro bucle) cuenta como otro; por eso el "solo en una" (43 de 72) sobrestima los programas realmente nuevos (la tabla por imagen de 16 KB da 57 filas y 30 imagenes distintas, 3 filas en las 5).
+**Conclusion para el generador**: un generador desde grabaciones cubre bien los ~12 bucles de reanudacion (>=85 % de los ciclos de cualquier escena con solo 4 grabaciones de otras partes) pero deja 10-15 % de ciclos en programas de entrada 0000 que cambian con la escena; hace falta que el generador compile por contenido del microcodigo
+(todas las imagenes y rutas vistas, no solo las 2 mas frecuentes) y mantenga el interprete como respaldo, o desensamblar las imagenes desde el disco en lugar de depender de lo ejecutado. No he cubierto los niveles 2+ ni el menu (el corpus es solo nivel 1, ticks ~2640-3908).
+
+### M0-d (parcial). Histograma dinamico de pares sobre el corpus
+`BLADE_VU1_HIST=1` con el banco diferencial cuenta, por par realmente ejecutado por el interprete (A), la clase de tuberia y el opcode; `scripts/vu1_hist_report.py` lo resume. Las 5 escenas suman **133,0 M de pares en 153,5 M de ciclos** (1,16 ciclos por par: las esperas por riesgo/Q/P son ~15 % de los ciclos; por escena 1,12-1,24).
+Reparto por mitad (% de los pares; escenas casi iguales, e1-e5 +-3 puntos):
+| Mitad | Clase | Pares | % |
+|---|---|---|---|
+| superior | FMAC (ADD/SUB/MUL/MADD..., incl. ITOF/FTOI/CLIP/OPMULA) | 116,2 M | **87,3** |
+| superior | NOP | 16,8 M | 12,7 |
+| inferior | load/store (LQ, SQ, SQI, LQI, ILW, ISW...) | 70,1 M | **52,7** |
+| inferior | IALU y banderas (IADDIU, IADD, FCAND, FCOR, MFIR...) | 25,9 M | 19,4 |
+| inferior | branch (IBEQ, IBNE, IBGEZ...) | 15,6 M | 11,7 |
+| inferior | **NOP** (se codifica como MOVE con dest 0; el recuento por opcode lo cuenta como MOVE) | 12,6 M | 9,5 |
+| inferior | MOVE/MR32 reales (tuberia FMAC) | 2,7 M | 2,0 |
+| inferior | FDIV/SQRT (DIV 3,5 %, SQRT/RSQRT el resto) | 5,2 M | 3,9 |
+| inferior | otros (MTIR, WAITQ...) | 0,6 M | 0,5 |
+| inferior | XGKICK | 0,1 M | 0,1 |
+| inferior | EFU | 2 484 | ~0 |
+Pares con LOI (constante en la inferior): 0,1 %. Aviso: la NOP inferior es `MOVE.0 vf0,vf0` (0x8000033C), por eso en las listas por opcode `MOVE` (10,3 %) es en realidad casi toda NOP; los MOVE reales son ~0,8 %.
+Opcodes de la mitad superior (todos los componentes bc juntos): MADDbc 14,6 %, MADDAbc 14,4 %, NOP 12,7 %, MULAbc 12,0 %, ADDbc 8,5 %, MUL 5,1 %, FTOI 4,5 %, MULq 3,5 %, CLIP 3,3 %, MADDq 2,9 %. De la inferior: LQ 29,4 %, SQI 10,5 %, MOVE 10,3 % (casi todo NOP, ver aviso), IADDIU 9,0 %, SQ 7,0 %, IBEQ 6,0 %, IBNE 3,7 %, DIV 3,5 %, FCAND 3,0 %, ILW 2,9 %.
+Lectura: el programa es una **transformacion de vertices**: ~87 % de pares con una FMAC util (multiplicar-acumular por componente) y mas de la mitad de las inferiores son cargas/almacenes; las lecturas de banderas (FCAND/FCOR) son el 3,9 % de los pares (FMAND casi no sale), los saltos el 11,7 %,
+las divisiones el 3,9 % (cada una bloquea la cola Q ~7 ciclos). Dominan MADD/MADDA/MULA con difusion de componente; el que el 12,7 % de las superiores sean NOP y el 9,5 % de las inferiores indica poco emparejado extra que ganar por reordenar. Sin ponderar por esperas: los ciclos de espera antes de cada par no estan separados
+(M0-d completo lo pedia; esto es solo el recuento de pares, que ya da el mix pedido).

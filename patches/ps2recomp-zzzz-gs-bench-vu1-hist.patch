@@ -1,0 +1,276 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h b/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
+index 93bbbe7..559216f 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
+@@ -6,9 +6,11 @@
+ #include <condition_variable>
+ #include <cstdint>
+ #include <deque>
++#include <functional>
+ #include <memory>
+ #include <mutex>
+ #include <thread>
++#include <atomic>
+ #include <vector>
+ 
+ // Ejecuta otro backend (el de CPU) en un hilo propio. Las ordenes que no devuelven nada (primitivas, CLUT,
+@@ -87,6 +89,17 @@ private:
+     std::unique_ptr<GSCpuBackend> m_inner;
+     std::vector<const GSPrimitiveBatch *> m_runScratch;
+     bool m_hasVram = false;
++    // Banco del GS aislado (PS2X_GS_BENCH, ver gs_threaded_backend.cpp)
++    uint8_t *m_benchVram = nullptr;
++    uint32_t m_benchVramSize = 0;
++    uint32_t m_benchPresents = 0;
++    uint32_t m_benchWindow = 0;
++    int m_benchState = 0; // 0 esperando, 1 grabando, 2 hecho
++    std::atomic<bool> m_benchRecording{false};
++    std::vector<Chunk> m_benchChunks;
++    std::vector<uint8_t> m_benchStart;
++    std::function<void()> *m_benchJob = nullptr; // protegido por m_queueMutex
++    bool m_benchDone = false;
+ 
+     mutable std::mutex m_producerMutex; // chunk en curso
+     std::unique_ptr<Chunk> m_current;
+diff --git a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+index 4b5fcdf..989f036 100644
+--- a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+@@ -1,8 +1,45 @@
+ #include "runtime/gs/gs_threaded_backend.h"
+ 
++#include <chrono>
++#include <functional>
++#include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+ 
++namespace
++{
++    // Banco del GS aislado (PS2X_GS_BENCH=primer_Present,cuantos[,repeticiones]): graba las ordenes que recibe el
++    // hilo del GS durante 'cuantos' Present desde el 'primer_Present' (con la VRAM de partida) y despues las repite
++    // sobre esa VRAM, sin el EE ni el VU1, midiendo el tiempo de pared. Apagado por defecto (no cambia el modo normal).
++    struct BenchCfg
++    {
++        bool on = false;
++        uint32_t first = 0, count = 0, reps = 5, stride = 0, windows = 1;
++    };
++    const BenchCfg &benchCfg()
++    {
++        static const BenchCfg cfg = []
++        {
++            BenchCfg c;
++            if (const char *e = std::getenv("PS2X_GS_BENCH"); e && *e)
++            {
++                unsigned a = 0, b = 0, r = 5, st = 0, w = 1;
++                if (std::sscanf(e, "%u,%u,%u,%u,%u", &a, &b, &r, &st, &w) >= 2 && b > 0)
++                {
++                    c.on = true;
++                    c.first = a;
++                    c.count = b;
++                    c.reps = r ? r : 5;
++                    c.stride = st;
++                    c.windows = w ? w : 1;
++                }
++            }
++            return c;
++        }();
++        return cfg;
++    }
++}
++
+ bool GSThreadedBackend::EnabledByEnvironment()
+ {
+     const char *env = std::getenv("PS2X_GS_THREAD");
+@@ -89,6 +126,18 @@ void GSThreadedBackend::workerLoop()
+             std::unique_lock<std::mutex> lock(m_queueMutex);
+             while (m_queue.empty() && !m_stop)
+             {
++                if (m_benchJob != nullptr)
++                {
++                    // Banco del GS aislado: la repeticion corre en este mismo hilo (misma prioridad y nucleos que en juego)
++                    std::function<void()> *job = m_benchJob;
++                    lock.unlock();
++                    (*job)();
++                    lock.lock();
++                    m_benchJob = nullptr;
++                    m_benchDone = true;
++                    m_doneCv.notify_all();
++                    continue;
++                }
+                 m_workerWaiting = true;
+                 m_queueCv.wait(lock);
+                 m_workerWaiting = false;
+@@ -114,6 +163,8 @@ void GSThreadedBackend::workerLoop()
+                 m_runScratch.push_back(&commands[i++].batch);
+             m_inner->SubmitMany(m_runScratch.data(), m_runScratch.size());
+         }
++        if (m_benchRecording.load(std::memory_order_acquire))
++            m_benchChunks.push_back(*chunk);
+         chunk->commands.clear();
+         chunk->data.clear();
+ 
+@@ -159,6 +210,8 @@ void GSThreadedBackend::Initialize(uint8_t *vram, uint32_t vramSize)
+     waitIdle();
+     m_inner->Initialize(vram, vramSize);
+     m_hasVram = vram != nullptr;
++    m_benchVram = vram;
++    m_benchVramSize = vramSize;
+ }
+ 
+ void GSThreadedBackend::Reset()
+@@ -225,6 +278,83 @@ void GSThreadedBackend::Sync(GSSyncReason reason)
+ PresentationFrame GSThreadedBackend::Present(const GSPresentationRequest &request)
+ {
+     waitIdle();
++    const BenchCfg &bc = benchCfg();
++    if (bc.on && m_benchState != 2 && m_benchVram != nullptr)
++    {
++        const uint32_t n = m_benchPresents++;
++        const uint32_t first = bc.first + m_benchWindow * bc.stride;
++        if (m_benchState == 0 && n >= first)
++        {
++            m_benchStart.assign(m_benchVram, m_benchVram + m_benchVramSize);
++            m_benchChunks.clear();
++            m_benchRecording.store(true, std::memory_order_release);
++            m_benchState = 1;
++        }
++        else if (m_benchState == 1 && n >= first + bc.count)
++        {
++            m_benchRecording.store(false, std::memory_order_release);
++            m_benchState = (m_benchWindow + 1u < bc.windows) ? 0 : 2;
++            ++m_benchWindow;
++            std::vector<uint8_t> endVram(m_benchVram, m_benchVram + m_benchVramSize);
++            size_t prims = 0, cmds = 0, upBytes = 0;
++            for (const Chunk &c : m_benchChunks)
++            {
++                cmds += c.commands.size();
++                upBytes += c.data.size();
++                for (const Command &cm : c.commands)
++                    prims += cm.op == Op::Submit;
++            }
++            std::fprintf(stderr, "[gsbench] ventana %u (Present %u..%u): grabados %zu chunks, %zu ordenes, %zu primitivas, %zu bytes de subida en %u Present\n",
++                         m_benchWindow - 1u, first, first + bc.count, m_benchChunks.size(), cmds, prims, upBytes, bc.count);
++            std::function<void()> job = [&]()
++            {
++                for (uint32_t rep = 0; rep < bc.reps; ++rep)
++                {
++                    std::memcpy(m_benchVram, m_benchStart.data(), m_benchVramSize);
++                    using Clk = std::chrono::steady_clock;
++                    double msSub = 0.0, msOther = 0.0;
++                    const auto t0 = Clk::now();
++                    for (const Chunk &c : m_benchChunks)
++                    {
++                        const std::vector<Command> &commands = c.commands;
++                        for (size_t i = 0; i < commands.size();)
++                        {
++                            if (commands[i].op != Op::Submit)
++                            {
++                                const auto o0 = Clk::now();
++                                execute(c, commands[i]);
++                                msOther += std::chrono::duration<double, std::milli>(Clk::now() - o0).count();
++                                ++i;
++                                continue;
++                            }
++                            m_runScratch.clear();
++                            while (i < commands.size() && commands[i].op == Op::Submit)
++                                m_runScratch.push_back(&commands[i++].batch);
++                            const auto s0 = Clk::now();
++                            m_inner->SubmitMany(m_runScratch.data(), m_runScratch.size());
++                            msSub += std::chrono::duration<double, std::milli>(Clk::now() - s0).count();
++                        }
++                    }
++                    const double ms = std::chrono::duration<double, std::milli>(Clk::now() - t0).count();
++                    std::fprintf(stderr, "[gsbench] repeticion %u: %.1f ms para %u Present = %.2f ms por Present (%.1f Present/s maximo); primitivas %.2f ms/Present, resto de ordenes (subidas, CLUT...) %.2f ms/Present\n",
++                                 rep, ms, bc.count, ms / bc.count, 1000.0 * bc.count / ms, msSub / bc.count, msOther / bc.count);
++                    std::fflush(stderr);
++                }
++                std::memcpy(m_benchVram, endVram.data(), m_benchVramSize);
++                m_benchChunks.clear();
++                m_benchStart.clear();
++                std::fflush(stderr);
++
++            };
++            {
++                std::unique_lock<std::mutex> lock(m_queueMutex);
++                m_benchDone = false;
++                m_benchJob = &job;
++                m_queueCv.notify_all();
++                m_doneCv.wait(lock, [&]() { return m_benchDone; });
++            }
++        }
++    }
+     return m_inner->Present(request);
+ }
+ 
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 5f9d29c..180dc41 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -131,6 +131,16 @@ uint64_t g_vu1GenFallback = 0;
+ static bool g_vu1ForceInterp = false;
+ // Banco diferencial: si no es nulo, el interprete marca en el los pares (PC >> 3) que ejecuta (inventario por contenido).
+ static std::bitset<2048> *g_vu1Visit = nullptr;
++// Banco diferencial: histograma dinamico de pares ejecutados por A (por clase de tuberia y por opcode).
++// Claves: superior = funct (0-63) o 64 + subcodigo (funct 0x3c-0x3f); inferior = op (0-127), 128 + funct (op 0x40,
++// funct < 0x3c) o 192 + subcodigo (op 0x40, funct 0x3c-0x3f).
++struct Vu1Hist
++{
++    uint64_t pairs = 0, upperNop = 0, lowerNop = 0, loi = 0;
++    uint64_t pipeUpper[8] = {}, pipeLower[8] = {};
++    uint64_t upperKey[192] = {}, lowerKey[320] = {};
++};
++static Vu1Hist g_vu1Hist;
+ 
+ struct VU1Internal
+ {
+@@ -943,6 +953,20 @@ int ps2xVu1Diff(const char *spec)
+                     (unsigned long long)r.second.cycles, 100.0 * r.second.cycles / std::max<uint64_t>(1, totalCyc),
+                     (unsigned long long)r.second.compared, (unsigned long long)r.second.badAB, (unsigned long long)r.second.badRec);
+     }
++    if (const char *hv = std::getenv("BLADE_VU1_HIST"); hv && *hv && *hv != '0')
++    {
++        const Vu1Hist &h = g_vu1Hist;
++        std::printf("[vu1hist] pares=%llu upperNop=%llu lowerNop=%llu loi=%llu\n", (unsigned long long)h.pairs, (unsigned long long)h.upperNop,
++                    (unsigned long long)h.lowerNop, (unsigned long long)h.loi);
++        for (int i = 0; i < 8; ++i)
++            std::printf("[vu1hist] pipe %d upper=%llu lower=%llu\n", i, (unsigned long long)h.pipeUpper[i], (unsigned long long)h.pipeLower[i]);
++        for (int i = 0; i < 192; ++i)
++            if (h.upperKey[i])
++                std::printf("[vu1hist] U %d %llu\n", i, (unsigned long long)h.upperKey[i]);
++        for (int i = 0; i < 320; ++i)
++            if (h.lowerKey[i])
++                std::printf("[vu1hist] L %d %llu\n", i, (unsigned long long)h.lowerKey[i]);
++    }
+     std::printf("[vu1diff] B = %s%s; %llu llamadas leidas, %llu comparadas, %llu con diferencias A!=B, %llu donde A no reproduce lo grabado, "
+                 "%llu fallos inyectados; %.2f s\n",
+                 bForceInterp ? "interprete forzado" : "despacho normal (compilado si existe)",
+@@ -2596,6 +2620,28 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         if (g_vu1Visit != nullptr && m_unit == Unit::VU1)
+             g_vu1Visit->set((m_state.pc >> 3) & 2047u);
+         const DecodedInstructionPair &decoded = getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
++        if (g_vu1Visit != nullptr && m_unit == Unit::VU1)
++        {
++            Vu1Hist &h = g_vu1Hist;
++            ++h.pairs;
++            const uint32_t u = decoded.upper, l = decoded.lower;
++            const uint32_t uf = u & 0x3Fu;
++            ++h.upperKey[uf >= 0x3Cu ? 64u + ((((u >> 6) & 0x1Fu) << 2) | (uf & 3u)) : uf];
++            h.upperNop += (u == 0x000002FFu);
++            ++h.pipeUpper[static_cast<unsigned>(decoded.upperUsage.pipeline) & 7u];
++            if (decoded.iBit)
++                ++h.loi;
++            else
++            {
++                const uint32_t op = l >> 25, lf = l & 0x3Fu;
++                uint32_t key = op;
++                if (op == 0x40u)
++                    key = lf < 0x3Cu ? 128u + lf : 192u + ((((l >> 6) & 0x1Fu) << 2) | (lf & 3u));
++                ++h.lowerKey[key];
++                h.lowerNop += (l == 0x8000033Cu);
++                ++h.pipeLower[static_cast<unsigned>(decoded.lowerUsage.pipeline) & 7u];
++            }
++        }
+         if (!stepPairT<false>(decoded, vuCode, vuData, dataSize, gs, memory, codeSize, budgetEnd, programEnded))
+             break;
+     }

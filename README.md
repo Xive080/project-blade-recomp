@@ -242,6 +242,10 @@ Herramientas propias (sin parche: `runner/blade_devtools.cpp`, solo se activan c
   falso: B es siempre "lo que elige `selectGenProgram`". Limitaciones: la inyeccion de fallos corrompe la salida de B (prueba el
   comparador, no un compilador); solo vale para llamadas grabadas con el microcodigo de 16 KB del VU1; el contenido ejecutado se mide
   con el interprete (A), asi que el inventario no ve los pares que A no pisa en esa muestra.
+- `BLADE_VU1_HIST=1` (con `BLADE_VU1_DIFF`; parche `ps2recomp-zzzz-gs-bench-vu1-hist.patch`): al final imprime el histograma dinamico de pares ejecutados por el interprete (clase de tuberia y opcode);
+  `python3 scripts/vu1_hist_report.py salida.txt...` lo resume. `scripts/vu1_record_corpus.sh` graba el corpus de 5 escenas del nivel 1 (una corrida a la vez).
+- `PS2X_GS_BENCH=primer_Present,cuantos[,repeticiones[,paso,ventanas]]` (mismo parche): banco del GS aislado; graba las ordenes del hilo del GS durante `cuantos` Present y las repite en ese hilo midiendo ms por Present
+  (el juego se para durante la repeticion; apagado por defecto). Resultados en `docs/PERFORMANCE_BASELINE.md` (M0).
 - Microprogramas VU1 compilados (parche `ps2recomp-vu1-z-compiled.patch`). El C++ generado a partir del microcodigo del
   disco es codigo del juego: NO se versiona (`work/vu1gen/`, ignorado) y se produce desde tu propio disco:
   1. Graba llamadas del nivel con el interprete puro: `PS2X_VU1_NOGEN=1 PS2X_VU1_RECORD=work/vu1gen/nivel.rec,1500000,20000`

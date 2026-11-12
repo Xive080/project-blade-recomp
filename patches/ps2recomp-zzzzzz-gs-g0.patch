@@ -1,0 +1,503 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp	2026-11-12 09:33:05
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp	2026-11-12 09:33:05
+@@ -817,7 +817,433 @@
+             return std::clamp<uint32_t>(static_cast<uint32_t>(std::strtoul(env, nullptr, 10)), 1u, 16u);
+         const uint32_t hw = std::max<uint32_t>(std::thread::hardware_concurrency(), 1u);
+         return std::clamp<uint32_t>(hw / 2u, 1u, 4u);
++    }
++}
++
++// ---- G0 (instrumentacion, apagada): clasificacion de las primitivas que SubmitManyImpl dibuja en serie por "textura solapa
++// destino". PS2X_GS_G0=desde,hasta (indices de Present). Calcula, por primitiva, los BLOQUES de 256 B de la VRAM que
++// realmente lee (rectangulo UV con margen de 1 texel, direcciones de swizzle exactas) y que realmente escribe (rectangulo
++// XY recortado al scissor, mas ZBUF si se usa), y los compara con el criterio de intervalos de paginas de hoy. Ademas
++// simula el reparto en tramos con la prueba exacta (bloques leidos frente a escritos) para saber cuantas primitivas
++// pasarian de serie a paralelo. No cambia el dibujo ni el reparto real. ----
++#include <bitset>
++#include <map>
++#include <mutex>
++#include <string>
++namespace
++{
++    struct G0Window { uint32_t from = 0, to = 0xFFFFFFFFu; bool on = false; };
++    const G0Window g_g0 = []()
++    {
++        G0Window w;
++        if (const char *e = std::getenv("PS2X_GS_G0"); e && *e && *e != '0')
++        {
++            w.on = true;
++            unsigned a = 0, b = 0xFFFFFFFFu;
++            if (std::sscanf(e, "%u,%u", &a, &b) >= 1) { w.from = a; w.to = b; }
++        }
++        return w;
++    }();
++    std::atomic<uint32_t> g_g0Present{0};
++    std::atomic<bool> g_g0Dumped{false};
++
++    using G0Blocks = std::bitset<16384>; // 4 MiB / 256 B
++
++    struct G0Stat { uint64_t n = 0, px = 0, ns = 0, rdPx = 0; };
++    struct G0State
++    {
++        std::mutex mu;
++        // reason 1 (textura solapa destino): por categoria
++        G0Stat cat[8];
++        std::map<std::string, G0Stat> groups;       // por (categoria, textura, destino)
++        std::map<std::string, std::string> groupEx; // ejemplo de rectangulos
++        G0Stat reason[3];                           // 0 destino/z solapados, 1 textura solapa destino, 2 tramo pequeno
++        G0Stat cause[12];                           // por que se corto el tramo pequeno (motivo 2)
++        G0Stat r0[2];                               // motivo 0: [0] sin bloques compartidos entre FRAME y ZBUF, [1] con bloques compartidos
++        uint64_t causeRuns[12] = {};
++        uint64_t zTrigger = 0, fTrigger = 0, bothTrigger = 0;
++        // simulacion con prueba exacta
++        uint64_t simPar = 0, simSer = 0, simParPx = 0, simSerPx = 0, simRuns = 0, totPrims = 0;
++        uint64_t presentFirst = 0, presentLast = 0, frames = 0;
++    } g_g0s;
++    const char *const kG0CatName[8] = {
++        "falso positivo: ni comparten pagina",
++        "falso positivo: comparten pagina, no bloque",
++        "real: realimentacion 1:1 en el mismo buffer",
++        "real: mismo buffer, UV desplazado/escalado",
++        "real: otro buffer, comparten bloques (copia/solape)",
++        "real: solo con el ZBUF",
++        "sin escritura: primitiva fuera del scissor", "UV sin rectangulo calculable"};
++
++    bool g0Block(uint32_t psm, uint32_t &w, uint32_t &h)
++    {
++        switch (static_cast<GSMem::PixelStorageMode>(psm & 0x3Fu))
++        {
++        case GSMem::C32: case GSMem::C24: case GSMem::Z32: case GSMem::Z24:
++        case GSMem::P8H: case GSMem::P4HL: case GSMem::P4HH: w = 8; h = 8; return true;
++        case GSMem::C16: case GSMem::C16S: case GSMem::Z16: case GSMem::Z16S: w = 16; h = 8; return true;
++        case GSMem::P8: w = 16; h = 16; return true;
++        case GSMem::P4: w = 32; h = 16; return true;
++        default: return false;
++        }
++    }
++
++    uint32_t g0ByteAddr(uint32_t psm, uint32_t bp, uint32_t bw, uint32_t x, uint32_t y)
++    {
++        using namespace GSMem;
++        const PixelStorageMode m = static_cast<PixelStorageMode>(psm & 0x3Fu);
++        uint32_t a = 0;
++        switch (m)
++        {
++        case C32: a = PixelStorageTraits<C32>::Address(PageTableC32, bp, bw, x, y); break;
++        case C24: a = PixelStorageTraits<C24>::Address(PageTableC32, bp, bw, x, y); break;
++        case C16: a = PixelStorageTraits<C16>::Address(PageTableC16, bp, bw, x, y); break;
++        case C16S: a = PixelStorageTraits<C16S>::Address(PageTableC16S, bp, bw, x, y); break;
++        case P8: a = PixelStorageTraits<P8>::Address(PageTableP8, bp, bw, x, y); break;
++        case P4: a = PixelStorageTraits<P4>::Address(PageTableP4, bp, bw, x, y); break;
++        case P8H: a = PixelStorageTraits<P8H>::Address(PageTableC32, bp, bw, x, y); break;
++        case P4HL: a = PixelStorageTraits<P4HL>::Address(PageTableC32, bp, bw, x, y); break;
++        case P4HH: a = PixelStorageTraits<P4HH>::Address(PageTableC32, bp, bw, x, y); break;
++        case Z32: a = PixelStorageTraits<Z32>::Address(PageTableZ32, bp, bw, x, y); break;
++        case Z24: a = PixelStorageTraits<Z24>::Address(PageTableZ32, bp, bw, x, y); break;
++        case Z16: a = PixelStorageTraits<Z16>::Address(PageTableZ16, bp, bw, x, y); break;
++        case Z16S: a = PixelStorageTraits<Z16S>::Address(PageTableZ16S, bp, bw, x, y); break;
++        default: return 0;
++        }
++        const uint32_t bits = a * static_cast<uint32_t>(UnpackedBitWidth(m));
++        return (bits / 8u) & (static_cast<uint32_t>(MEMORY_SIZE) - 1u);
++    }
++
++    struct G0Rect { int x0 = 0, y0 = 0, x1 = -1, y1 = -1; bool ok = false; };
++
++    // Bloques de un rectangulo de pixeles (inclusivo) de un buffer: una muestra por celda de bloque, direccion exacta
++    void g0Blocks(const G0Rect &r, uint32_t psm, uint32_t bp, uint32_t bw, G0Blocks &out)
++    {
++        uint32_t bwid = 0, bh = 0;
++        if (!r.ok || !g0Block(psm, bwid, bh))
++            return;
++        const int x0 = std::max(r.x0, 0), y0 = std::max(r.y0, 0);
++        const int x1 = std::min(r.x1, 4095), y1 = std::min(r.y1, 4095);
++        if (x1 < x0 || y1 < y0)
++            return;
++        const int cells = ((x1 / static_cast<int>(bwid)) - (x0 / static_cast<int>(bwid)) + 1) * ((y1 / static_cast<int>(bh)) - (y0 / static_cast<int>(bh)) + 1);
++        if (cells > 70000)
++            return;
++        for (int by = y0 / static_cast<int>(bh); by <= y1 / static_cast<int>(bh); ++by)
++            for (int bx = x0 / static_cast<int>(bwid); bx <= x1 / static_cast<int>(bwid); ++bx)
++            {
++                const int px = std::max(x0, bx * static_cast<int>(bwid)), py = std::max(y0, by * static_cast<int>(bh));
++                out.set((g0ByteAddr(psm, bp, bw, static_cast<uint32_t>(px), static_cast<uint32_t>(py)) >> 8) & 16383u);
++            }
++    }
++
++    G0Rect g0WriteRect(const GSPrimitiveBatch &b)
++    {
++        const auto &ctx = b.state.context;
++        const uint32_t n = std::max<uint32_t>(1u, std::min<uint32_t>(b.vertexCount, 3u));
++        float x0 = b.vertices[0].x, x1 = x0, y0 = b.vertices[0].y, y1 = y0;
++        for (uint32_t k = 1; k < n; ++k)
++        {
++            x0 = std::min(x0, b.vertices[k].x); x1 = std::max(x1, b.vertices[k].x);
++            y0 = std::min(y0, b.vertices[k].y); y1 = std::max(y1, b.vertices[k].y);
++        }
++        const int ofx = ctx.xyoffset.ofx >> 4, ofy = ctx.xyoffset.ofy >> 4;
++        G0Rect r;
++        r.x0 = std::max(static_cast<int>(std::floor(x0)) - ofx - 1, static_cast<int>(ctx.scissor.x0));
++        r.y0 = std::max(static_cast<int>(std::floor(y0)) - ofy - 1, static_cast<int>(ctx.scissor.y0));
++        r.x1 = std::min(static_cast<int>(std::ceil(x1)) - ofx + 1, static_cast<int>(ctx.scissor.x1));
++        r.y1 = std::min(static_cast<int>(std::ceil(y1)) - ofy + 1, static_cast<int>(ctx.scissor.y1));
++        r.ok = r.x1 >= r.x0 && r.y1 >= r.y0;
++        return r;
++    }
++
++    G0Rect g0ReadRect(const GSPrimitiveBatch &b)
++    {
++        const auto &st = b.state;
++        const auto &ctx = st.context;
++        const int tw = std::max<int>(st.textureWidth, 1), th = std::max<int>(st.textureHeight, 1);
++        const uint32_t n = std::max<uint32_t>(1u, std::min<uint32_t>(b.vertexCount, 3u));
++        float u0 = 1e30f, u1 = -1e30f, v0 = 1e30f, v1 = -1e30f;
++        for (uint32_t k = 0; k < n; ++k)
++        {
++            const auto &v = b.vertices[k];
++            float fu, fv;
++            if (st.prim.fst) { fu = v.u / 16.0f; fv = v.v / 16.0f; }
++            else
++            {
++                const float q = std::fabs(v.q);
++                if (q < 1e-20f) { G0Rect full; full.x0 = 0; full.y0 = 0; full.x1 = tw - 1; full.y1 = th - 1; full.ok = true; return full; }
++                fu = v.s / q * static_cast<float>(tw);
++                fv = v.t / q * static_cast<float>(th);
++            }
++            u0 = std::min(u0, fu); u1 = std::max(u1, fu); v0 = std::min(v0, fv); v1 = std::max(v1, fv);
++        }
++        const uint64_t cl = ctx.clamp;
++        const uint32_t wu = static_cast<uint32_t>(cl & 3u), wv = static_cast<uint32_t>((cl >> 2) & 3u);
++        const int minU = static_cast<int>((cl >> 4) & 0x3FF), maxU = static_cast<int>((cl >> 14) & 0x3FF);
++        const int minV = static_cast<int>((cl >> 24) & 0x3FF), maxV = static_cast<int>((cl >> 34) & 0x3FF);
++        G0Rect r;
++        auto axis = [](float lo, float hi, int size, uint32_t mode, int rmin, int rmax, int &a, int &bb)
++        {
++            a = static_cast<int>(std::floor(lo)) - 1;
++            bb = static_cast<int>(std::ceil(hi)) + 1;
++            const bool inside = a >= 0 && bb <= size - 1;
++            if (mode == 1u) { a = std::min(std::max(a, 0), size - 1); bb = std::min(std::max(bb, 0), size - 1); }
++            else if (mode == 2u) { a = std::min(std::max(a, rmin), rmax); bb = std::min(std::max(bb, rmin), rmax); }
++            else if (!inside) { a = 0; bb = (mode == 3u ? 1023 : size - 1); } // repeat: la textura entera (conservador)
++        };
++        axis(u0, u1, tw, wu, minU, maxU, r.x0, r.x1);
++        axis(v0, v1, th, wv, minV, maxV, r.y0, r.y1);
++        r.ok = r.x1 >= r.x0 && r.y1 >= r.y0;
++        return r;
++    }
++
++    struct G0Info
++    {
++        G0Rect wr, rd;
++        G0Blocks frame, z, read;
++        bool zUsed = false, tme = false;
++    };
++
++    void g0Compute(const GSPrimitiveBatch &b, G0Info &o)
++    {
++        const auto &ctx = b.state.context;
++        o.frame.reset(); o.z.reset(); o.read.reset();
++        o.tme = b.state.prim.tme;
++        o.zUsed = zbufferUsed(ctx);
++        o.wr = g0WriteRect(b);
++        g0Blocks(o.wr, ctx.frame.psm, GSInternal::framePageBaseToBlock(ctx.frame.fbp), std::max<uint32_t>(ctx.frame.fbw, 1u), o.frame);
++        if (o.zUsed)
++            g0Blocks(o.wr, ctx.zbuf.psm, GSInternal::framePageBaseToBlock(ctx.zbuf.zbp), std::max<uint32_t>(ctx.frame.fbw, 1u), o.z);
++        if (o.tme)
++        {
++            o.rd = g0ReadRect(b);
++            g0Blocks(o.rd, ctx.tex0.psm, ctx.tex0.tbp0, std::max<uint32_t>(ctx.tex0.tbw, 1u), o.read);
++        }
++    }
++
++    G0Blocks g0Pages(const G0Blocks &bl)
++    {
++        G0Blocks p;
++        for (size_t i = 0; i < bl.size(); ++i)
++            if (bl.test(i)) { for (size_t k = 0; k < 32; ++k) p.set((i / 32) * 32 + k); }
++        return p;
++    }
++
++    // Categoria de una primitiva en serie por "textura solapa destino"
++    int g0Classify(const GSPrimitiveBatch &b, const G0Info &o)
++    {
++        const auto &ctx = b.state.context;
++        if (!o.wr.ok)
++            return 6;
++        if (!o.rd.ok)
++            return 7;
++        const bool ovF = (o.read & o.frame).any();
++        const bool ovZ = (o.read & o.z).any();
++        if (!ovF && !ovZ)
++            return (g0Pages(o.read) & g0Pages(o.frame | o.z)).any() ? 1 : 0;
++        if (!ovF && ovZ)
++            return 5;
++        const uint32_t fb = GSInternal::framePageBaseToBlock(ctx.frame.fbp);
++        const bool sameBuf = ctx.tex0.tbp0 == fb;
++        if (!sameBuf)
++            return 4;
++        const int dx = (o.rd.x0 + 1) - o.wr.x0 - 1, dy = (o.rd.y0 + 1) - o.wr.y0 - 1; // sin margenes de lectura/escritura
++        const int sw = (o.rd.x1 - o.rd.x0 - 2) - (o.wr.x1 - o.wr.x0 - 2), sh = (o.rd.y1 - o.rd.y0 - 2) - (o.wr.y1 - o.wr.y0 - 2);
++        const bool sameFmt = (ctx.tex0.psm & 0x0Fu) == (ctx.frame.psm & 0x0Fu) || ((ctx.tex0.psm & 3u) == (ctx.frame.psm & 3u));
++        if (sameFmt && std::abs(dx) <= 2 && std::abs(dy) <= 2 && std::abs(sw) <= 2 && std::abs(sh) <= 2)
++            return 2;
++        return 3;
+     }
++
++    const char *const kG0CauseName[12] = {
++        "fin de la llamada SubmitMany (no hay mas primitivas)", "cambia FBP", "cambia FBW", "cambia PSM del FRAME", "cambia ZBP", "cambia PSM del ZBUF",
++        "cambia uso de Z", "cambia scissor.y1", "la textura de la siguiente solapa destino (rangos)", "textura previa del tramo solapa destino (fila nueva)",
++        "otro", ""};
++
++    // Por que acabo el tramo [first, j): j es el indice de la primitiva que lo corta (o count)
++    int g0Cause(const GSPrimitiveBatch *const *batches, size_t first, size_t j, size_t count)
++    {
++        while (j < count && batches[j]->vertexCount == 0u)
++            ++j;
++        if (j >= count)
++            return 0;
++        const auto &a = batches[first]->state.context;
++        const auto &bs = batches[j]->state;
++        const auto &b = bs.context;
++        if (a.frame.fbp != b.frame.fbp) return 1;
++        if (a.frame.fbw != b.frame.fbw) return 2;
++        if (a.frame.psm != b.frame.psm) return 3;
++        if (a.zbuf.zbp != b.zbuf.zbp) return 4;
++        if (a.zbuf.psm != b.zbuf.psm) return 5;
++        if (zbufferUsed(a) != zbufferUsed(b)) return 6;
++        if (a.scissor.y1 != b.scissor.y1) return 7;
++        if (bs.prim.tme) return 8;
++        return 9;
++    }
++
++    bool g0Active()
++    {
++        if (!g_g0.on)
++            return false;
++        const uint32_t p = g_g0Present.load(std::memory_order_relaxed);
++        return p >= g_g0.from && p < g_g0.to;
++    }
++
++    void g0Dump()
++    {
++        std::lock_guard<std::mutex> lk(g_g0s.mu);
++        auto &s = g_g0s;
++        const double fr = std::max<uint64_t>(s.frames, 1);
++        std::fprintf(stderr, "[g0] ==== resumen: Present %llu..%llu (%llu Present con dibujo) ====\n",
++                     (unsigned long long)s.presentFirst, (unsigned long long)s.presentLast, (unsigned long long)s.frames);
++        std::fprintf(stderr, "[g0] primitivas totales por Present: %.0f\n", s.totPrims / fr);
++        const char *rn[3] = {"destino/z solapados", "textura solapa destino", "tramo pequeno (<4096 px)"};
++        for (int k = 0; k < 2; ++k)
++            std::fprintf(stderr, "[g0] motivo 0 (FRAME/ZBUF solapan por rangos), %s: prim/Present=%.0f px/prim=%.0f ms/Present=%.2f\n", k ? "con bloques compartidos (real)" : "sin bloques compartidos (falso)",
++                         s.r0[k].n / fr, s.r0[k].n ? (double)s.r0[k].px / s.r0[k].n : 0.0, s.r0[k].ns / 1e6 / fr);
++        for (int k = 0; k < 11; ++k)
++            if (s.cause[k].n)
++                std::fprintf(stderr, "[g0] motivo 2 (tramo pequeno) cortado por '%s': tramos/Present=%.0f prim/Present=%.0f px/prim=%.0f ms/Present=%.2f\n", kG0CauseName[k],
++                             s.causeRuns[k] / fr, s.cause[k].n / fr, (double)s.cause[k].px / s.cause[k].n, s.cause[k].ns / 1e6 / fr);
++        for (int k = 0; k < 3; ++k)
++            std::fprintf(stderr, "[g0] serie motivo '%s': prim/Present=%.0f px/prim=%.0f ms/Present=%.2f\n", rn[k], s.reason[k].n / fr,
++                         s.reason[k].n ? (double)s.reason[k].px / s.reason[k].n : 0.0, s.reason[k].ns / 1e6 / fr);
++        std::fprintf(stderr, "[g0] 'textura solapa destino' disparado por: solo FRAME=%llu solo ZBUF=%llu ambos=%llu\n",
++                     (unsigned long long)s.fTrigger, (unsigned long long)s.zTrigger, (unsigned long long)s.bothTrigger);
++        for (int c = 0; c < 8; ++c)
++            std::fprintf(stderr, "[g0] cat %d '%s': prim/Present=%.0f px(escritos)/prim=%.0f px(leidos, rect UV)/prim=%.0f ms/Present=%.2f\n", c, kG0CatName[c],
++                         s.cat[c].n / fr, s.cat[c].n ? (double)s.cat[c].px / s.cat[c].n : 0.0, s.cat[c].n ? (double)s.cat[c].rdPx / s.cat[c].n : 0.0, s.cat[c].ns / 1e6 / fr);
++        std::fprintf(stderr, "[g0] simulacion con prueba exacta de bloques: paralelo=%.0f prim/Present (%.1f Mpx/Present), serie=%.0f prim/Present (%.2f Mpx/Present), tramos paralelos=%.1f/Present\n",
++                     s.simPar / fr, s.simParPx / 1e6 / fr, s.simSer / fr, s.simSerPx / 1e6 / fr, s.simRuns / fr);
++        std::vector<std::pair<uint64_t, std::string>> v;
++        for (auto &kv : s.groups)
++            v.emplace_back(kv.second.ns, kv.first);
++        std::sort(v.rbegin(), v.rend());
++        for (size_t i = 0; i < v.size() && i < 40; ++i)
++        {
++            const auto &g = s.groups[v[i].second];
++            std::fprintf(stderr, "[g0] grupo %s | prim/Present=%.1f ms/Present=%.3f px/prim=%.0f | ej %s\n", v[i].second.c_str(), g.n / fr, g.ns / 1e6 / fr,
++                         g.n ? (double)g.px / g.n : 0.0, s.groupEx[v[i].second].c_str());
++        }
++        std::fflush(stderr);
++    }
++
++    // Simulacion del reparto en tramos con la prueba exacta (misma estructura que SubmitManyImpl)
++    void g0Simulate(const GSPrimitiveBatch *const *batches, size_t count)
++    {
++        static thread_local G0Info info;
++        static thread_local G0Blocks wset, rset;
++        uint64_t par = 0, ser = 0, parPx = 0, serPx = 0, runs = 0;
++        size_t i = 0;
++        while (i < count)
++        {
++            const GSPrimitiveBatch &first = *batches[i];
++            if (first.vertexCount == 0u) { ++i; continue; }
++            const bool zUsed = zbufferUsed(first.state.context);
++            int y1 = primMaxRow(first);
++            const bool targetOk = !rangesOverlap(targetRange(first.state.context.frame.fbp, first.state.context.frame.fbw, first.state.context.frame.psm, y1),
++                                                 zUsed ? targetRange(first.state.context.zbuf.zbp, first.state.context.frame.fbw, first.state.context.zbuf.psm, y1) : PageRange{});
++            size_t j = i;
++            uint64_t pixels = 0, nprim = 0;
++            if (targetOk)
++            {
++                wset.reset(); rset.reset();
++                while (j < count)
++                {
++                    const GSPrimitiveBatch &b = *batches[j];
++                    if (b.vertexCount == 0u) { ++j; continue; }
++                    if (!sameTarget(first.state, b.state)) break;
++                    g0Compute(b, info);
++                    const G0Blocks w = info.frame | info.z;
++                    if ((info.read & (wset | w)).any() || (w & rset).any())
++                        break;
++                    wset |= w; rset |= info.read;
++                    pixels += approximatePixels(b);
++                    ++nprim;
++                    ++j;
++                }
++            }
++            if (j - i >= 1u && pixels >= 4096u) { par += nprim; parPx += pixels; ++runs; i = j; continue; }
++            const size_t end = (j > i) ? j : i + 1u;
++            for (; i < end; ++i)
++                if (batches[i]->vertexCount != 0u) { ++ser; serPx += approximatePixels(*batches[i]); }
++        }
++        std::lock_guard<std::mutex> lk(g_g0s.mu);
++        g_g0s.simPar += par; g_g0s.simSer += ser; g_g0s.simParPx += parPx; g_g0s.simSerPx += serPx; g_g0s.simRuns += runs;
++        g_g0s.totPrims += par + ser;
++    }
++
++    // Una primitiva en serie: clasifica (si el motivo es 1), la dibuja y mide
++    template <class DrawFn>
++    void g0SerialPrim(const GSPrimitiveBatch &b, int reason, int cause, bool runStart, bool bandsOn, DrawFn draw)
++    {
++        static thread_local G0Info info;
++        int cat = -1;
++        bool trigF = false, trigZ = false;
++        bool r0exact = false, r0coarse = false;
++        if (reason == 0)
++        {
++            g0Compute(b, info);
++            r0exact = (info.frame & info.z).any();
++            const auto &cc = b.state.context;
++            const int yy = primMaxRow(b);
++            r0coarse = rangesOverlap(targetRange(cc.frame.fbp, cc.frame.fbw, cc.frame.psm, yy),
++                                     info.zUsed ? targetRange(cc.zbuf.zbp, cc.frame.fbw, cc.zbuf.psm, yy) : PageRange{});
++        }
++        if (reason == 1)
++        {
++            g0Compute(b, info);
++            cat = g0Classify(b, info);
++            const auto &ctx = b.state.context;
++            const int y1 = primMaxRow(b);
++            const PageRange tr = textureRange(b.state);
++            trigF = rangesOverlap(tr, targetRange(ctx.frame.fbp, ctx.frame.fbw, ctx.frame.psm, y1));
++            trigZ = info.zUsed && rangesOverlap(tr, targetRange(ctx.zbuf.zbp, ctx.frame.fbw, ctx.zbuf.psm, y1));
++        }
++        const auto t0 = std::chrono::steady_clock::now();
++        draw();
++        const uint64_t ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
++        const uint64_t px = approximatePixels(b);
++        std::lock_guard<std::mutex> lk(g_g0s.mu);
++        auto &s = g_g0s;
++        s.reason[reason].n++; s.reason[reason].px += px; s.reason[reason].ns += ns;
++        if (reason == 0)
++        {
++            auto &g = s.r0[r0exact ? 1 : 0];
++            g.n++; g.px += px; g.ns += ns;
++            const auto &c0 = b.state.context;
++            char key[160];
++            std::snprintf(key, sizeof(key), "R0 %s bandas=%d rangosFZ=%d dst(fbp=%u fbw=%u psm=%02x) z(zbp=%u psm=%02x) z=%d", r0exact ? "REAL" : "falso", (int)bandsOn, (int)r0coarse, c0.frame.fbp, c0.frame.fbw, (unsigned)c0.frame.psm, c0.zbuf.zbp, (unsigned)c0.zbuf.psm, (int)info.zUsed);
++            auto &gg = s.groups[key]; gg.n++; gg.px += px; gg.ns += ns;
++            return;
++        }
++        if (reason == 2 && cause >= 0)
++        {
++            s.cause[cause].n++; s.cause[cause].px += px; s.cause[cause].ns += ns;
++            if (runStart) s.causeRuns[cause]++;
++            return;
++        }
++        if (reason != 1)
++            return;
++        if (trigF && trigZ) s.bothTrigger++; else if (trigF) s.fTrigger++; else if (trigZ) s.zTrigger++;
++        const uint64_t rpx = info.rd.ok ? static_cast<uint64_t>(info.rd.x1 - info.rd.x0 + 1) * static_cast<uint64_t>(info.rd.y1 - info.rd.y0 + 1) : 0;
++        auto add = [&](G0Stat &g) { g.n++; g.px += px; g.ns += ns; g.rdPx += rpx; };
++        add(s.cat[cat]);
++        const auto &ctx = b.state.context;
++        char key[200];
++        std::snprintf(key, sizeof(key), "cat%d tex(tbp=%u psm=%02x tbw=%u %dx%d) dst(fbp=%u fbw=%u psm=%02x z=%s zbp=%u)", cat, ctx.tex0.tbp0, (unsigned)ctx.tex0.psm,
++                      (unsigned)ctx.tex0.tbw, (int)b.state.textureWidth, (int)b.state.textureHeight, ctx.frame.fbp, ctx.frame.fbw, (unsigned)ctx.frame.psm,
++                      info.zUsed ? "si" : "no", ctx.zbuf.zbp);
++        add(s.groups[key]);
++        if (!s.groupEx.count(key))
++        {
++            char ex[200];
++            std::snprintf(ex, sizeof(ex), "leido UV [%d,%d]-[%d,%d] escrito XY [%d,%d]-[%d,%d] tme=%d fst=%d abe=%d tfx=%u", info.rd.x0, info.rd.y0, info.rd.x1, info.rd.y1,
++                          info.wr.x0, info.wr.y0, info.wr.x1, info.wr.y1, (int)b.state.prim.tme, (int)b.state.prim.fst, (int)b.state.prim.abe, (unsigned)ctx.tex0.tfx);
++            s.groupEx[key] = ex;
++        }
++    }
+ }
+ 
+ // ---- Rutas rapidas del rasterizador (misma aritmetica que SampleTexture/WritePixel, con lo invariante de la
+@@ -1322,6 +1748,9 @@
+ void GSCpuBackend::SubmitManyImpl(const GSPrimitiveBatch *const *batches, size_t count)
+ {
+     static thread_local std::vector<PageRange> texRanges;
++    const bool g0 = g0Active();
++    if (g0)
++        g0Simulate(batches, count);
+ 
+     size_t i = 0;
+     while (i < count)
+@@ -1411,6 +1840,7 @@
+         const auto st0 = g_gsProfile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+         uint64_t serPix = 0, serPrims = 0;
+         const size_t serFirst = i;
++        const int g0cause = (g0 && targetOk && j > serFirst) ? g0Cause(batches, serFirst, j, count) : -1;
+         for (; i < end; ++i)
+             if (batches[i]->vertexCount != 0u)
+             {
+@@ -1419,7 +1849,13 @@
+                     serPix += approximatePixels(*batches[i]);
+                     ++serPrims;
+                 }
+-                DrawPrimitive(*batches[i]);
++                if (g0)
++                {
++                    const int g0reason = !targetOk ? 0 : (j == serFirst ? 1 : 2);
++                    g0SerialPrim(*batches[i], g0reason, g0cause, i == serFirst, bandsOn, [&]() { DrawPrimitive(*batches[i]); });
++                }
++                else
++                    DrawPrimitive(*batches[i]);
+             }
+         if (g_gsProfile)
+         {
+@@ -2920,6 +3356,32 @@
+ {
+     // Snapshot local memory under the backend lock, then perform the expensive
+     // display conversion without holding the producer-side raster lock.
++    if (g_g0.on)
++    {
++        const uint32_t pn = g_g0Present.fetch_add(1u, std::memory_order_relaxed) + 1u;
++        if (pn > g_g0.from && pn <= g_g0.to)
++        {
++            std::lock_guard<std::mutex> lk(g_g0s.mu);
++            if (g_g0s.presentFirst == 0) g_g0s.presentFirst = pn;
++            g_g0s.presentLast = pn;
++            ++g_g0s.frames;
++        }
++        if (pn >= g_g0.to && !g_g0Dumped.exchange(true))
++            g0Dump();
++        static const bool g0AtExit = []() { std::atexit([]() { if (!g_g0Dumped.exchange(true)) g0Dump(); }); return true; }();
++        (void)g0AtExit;
++        if ((pn % 100u) == 0u)
++        {
++            std::lock_guard<std::mutex> lk(g_g0s.mu);
++            const auto &t = g_g0s;
++            std::fprintf(stderr, "[g0c] Present %u frames=%llu tot=%llu", pn, (unsigned long long)t.frames, (unsigned long long)t.totPrims);
++            for (int k = 0; k < 3; ++k)
++                std::fprintf(stderr, " R%d=%llu/%llu/%llu", k, (unsigned long long)t.reason[k].n, (unsigned long long)t.reason[k].px, (unsigned long long)t.reason[k].ns);
++            for (int k = 0; k < 7; ++k)
++                std::fprintf(stderr, " C%d=%llu/%llu/%llu/%llu", k, (unsigned long long)t.cat[k].n, (unsigned long long)t.cat[k].px, (unsigned long long)t.cat[k].rdPx, (unsigned long long)t.cat[k].ns);
++            std::fprintf(stderr, " SIM=%llu/%llu/%llu/%llu/%llu\n", (unsigned long long)t.simPar, (unsigned long long)t.simParPx, (unsigned long long)t.simSer, (unsigned long long)t.simSerPx, (unsigned long long)t.simRuns);
++        }
++    }
+     thread_local std::vector<uint8_t> snapshot;
+     SnapshotVram(snapshot);
+     if (snapshot.empty())

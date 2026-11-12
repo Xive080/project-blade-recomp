@@ -99,7 +99,7 @@ mismo build ni el mismo parche (regla del ADR); las medidas de V/s se hacen de u
 | 2 | **M0-a** referencias `qa/ref_det` con el oraculo de D1 | comun | Sonnet | D1 | toda la regresion |
 | 3 | **M0-e** (nuevo) reparto de R (logica frente a dibujo en el hilo EE) e histograma del estado del GS | comun | Sonnet | — | 120, G2 |
 | 4 | P1 → P2 → P3 → P4 → P5 → P6 (§3, sin cambios de fondo; P4/P6 cubren el corpus de 5 escenas) | VU1 | Opus / Sonnet | D1, M0-a | 30-55 V/s de capacidad del EE |
-| 5 | **G0** (nuevo) clasificar las ~8 000 primitivas serie por VSync | GS | Sonnet | — | G1-a, G2 |
+| 5 | **G0** (nuevo) clasificar las ~8 000 primitivas serie por VSync — **HECHO 2026-11-12** (ver 0.9 y `PERFORMANCE_BASELINE.md`, «G0») | GS | Sonnet | — | G1-a, G2 |
 | 6 | **G1-a** (nuevo, sustituye a G1) comprobacion de solape exacta en la CPU | GS | Sonnet (+Opus si hay diferencias) | G0 | +5-10 V/s de techo de CPU y la regla de barreras de G2 |
 | 7 | **D2** (nuevo) decidir la via de GPU **portable** (Vulkan/MoltenVK o wgpu; no Metal propio, ver §0.0) | GS | Opus | G0 | G2 |
 | 8 | **G2** (nuevo) backend del GS en GPU, v1 exacta y v2 rapida | GS | Opus (diseno, depuracion) + Sonnet (formatos y funciones, con banco) | D2 | 60 y 120 |
@@ -296,6 +296,13 @@ P7 ni I1 esta medido.
   en serie por "textura solapa destino": tipo, tamano en pixeles, rectangulo UV leido y XY escrito en paginas/bloques del GS, PSM
   de los dos, y si el solape es real (algun bloque leido se escribe en la misma pasada) o solo de rango de TBP. Agrupar por estado
   (es probable que sean pocos efectos: sombra, reflejos, post-proceso **[H]**). Criterio: la suma da las ~8 000/VSync de M0-b.
+  **RESULTADO G0 (HECHO 2026-11-12; instrumentacion `patches/ps2recomp-zzzzzz-gs-g0.patch`, `PS2X_GS_G0`, `scripts/g0_classify.sh`; tablas en `PERFORMANCE_BASELINE.md`, «G0»)**: la hipotesis de M0-b era falsa. De 10 572 primitivas en serie por Present (ticks 2600-3900),
+  solo **471 (4,5 %) son «textura solapa destino»** (2,8 de 10,8 ms serie); 3 742 (65 % del tiempo) son «destino/z solapados» por intervalos de paginas de FRAME/ZBUF que no comparten ningun bloque (todas falsas) y 6 359 (60 % de las primitivas, 10 % del tiempo) son tramos pequeños (~20 px)
+  cortados por el fin de cada `SubmitMany`. De las 471: 50 falsos positivos (2,6 ms, un efecto de pantalla de 25 000 px), 419 sin escritura (fuera del scissor), 2 solape real parcial (sprite que lee el propio FRAME desplazado), 0 copias entre buffers, ~0 realimentacion 1:1.
+  Con prueba exacta solo de textura desaparece el 24 % del tiempo serie; con textura + FRAME/ZBUF exactos, el ~89 % (~7 ms de pared por VSync **[H]**). Modo normal sin cambios (hash RAM+imagen del tick 3000 identico con y sin G0).
+  **Que cambia para G1-a**: (1) debe incluir la prueba exacta de FRAME/ZBUF (motivo 0), que es lo que mas pesa y no estaba en el alcance; (2) la de textura vale poco por si sola (~+2 V/s de techo, no +5-10); (3) juntos, techo de CPU ~36 V/s **[H]**, en el extremo alto del 30-40 de §0.4; (4) el ~10 % restante (tramos pequeños cortados por llamada) solo cede juntando tramos entre `SubmitMany`;
+  (5) la prueba para producir debe ser barata (rectangulos de paginas exactos), no el bitset de la medida. **Que cambia para G2**: la rama optima de §0.5: realimentacion/copias reales = 2 primitivas/Present, asi que las barreras por «textura solapa destino» son del orden de unidades, no miles; las de cat. 3 llevan copia previa del rango compartido
+  (regla 6 de la referencia) y el resto va sin barrera. Salvedad: solo nivel 1, ticks 2600-3900.
 - **G1-a (Sonnet; Opus si hay diferencias)**: cambiar la prueba de solape del rasterizador de CPU por la exacta de G0 (por bloques
   leidos frente a escritos). Verificacion: `PS2X_GS_AB=1` en 0 en una corrida completa, `qa_regression.sh` identico (la imagen no
   puede cambiar), y los ms/V del banco aislado antes y despues. Si una primitiva se mueve de serie a paralelo y cambia un pixel, la
@@ -655,7 +662,7 @@ PCSX2). Juega a velocidad real, pero no da mas fluidez.
 | Medidas con la maquina cargada | load average en cada fila | repetir; no comparar corridas con carga distinta |
 | Romper el modo determinista | `qa_regression.sh` tras cada paso que toque el runtime | el compilado tiene que dar los mismos hashes que el interprete; T1 con barrera |
 | (2026-11-12) GS en GPU distinto de la CPU | banco de capturas `PS2X_GS_BENCH` en los dos backends | bit a bit en VRAM donde sea entero; tolerancia declarada y hash tolerante si no; CPU como respaldo |
-| (2026-11-12) Barreras por "textura solapa destino" en GPU | G0 | prueba de solape exacta (G1-a); agrupar las que leen la misma fuente |
+| (2026-11-12) Barreras por "textura solapa destino" en GPU (G0 hecho: ~2 reales por VSync en el nivel 1; riesgo bajo, falta ver otras escenas) | G0 | prueba de solape exacta (G1-a); agrupar las que leen la misma fuente |
 | (2026-11-12) Logica que no usa `dt` (literales 0,02/50,0, contadores por paso) | L0 | interpolacion (I1) si L0 falla |
 | (2026-11-12) Dibujo con efectos de logica (interpolacion) | I0 | lista de efectos antes de I1; `alfa = 1` da los mismos hashes |
 | (2026-11-12) Dos vias en paralelo pisandose | ADR: un agente por build | worktree y `build/gpu` propios para la via del GS |

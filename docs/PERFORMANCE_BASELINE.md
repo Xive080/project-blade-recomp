@@ -244,3 +244,55 @@ Opcodes de la mitad superior (todos los componentes bc juntos): MADDbc 14,6 %, M
 Lectura: el programa es una **transformacion de vertices**: ~87 % de pares con una FMAC util (multiplicar-acumular por componente) y mas de la mitad de las inferiores son cargas/almacenes; las lecturas de banderas (FCAND/FCOR) son el 3,9 % de los pares (FMAND casi no sale), los saltos el 11,7 %,
 las divisiones el 3,9 % (cada una bloquea la cola Q ~7 ciclos). Dominan MADD/MADDA/MULA con difusion de componente; el que el 12,7 % de las superiores sean NOP y el 9,5 % de las inferiores indica poco emparejado extra que ganar por reordenar. Sin ponderar por esperas: los ciclos de espera antes de cada par no estan separados
 (M0-d completo lo pedia; esto es solo el recuento de pares, que ya da el mix pedido).
+
+## G0: clasificacion de las primitivas que el GS por CPU dibuja en serie (2026-11-12)
+Instrumentacion: `patches/ps2recomp-zzzzzz-gs-g0.patch` (en `gs_cpu_backend.cpp`; **apagada** salvo `PS2X_GS_G0=desde,hasta`, indices de Present; sin la variable la huella es una comparacion por Present y una por `SubmitMany`; no cambia el dibujo ni el reparto real). Para cada primitiva
+que `SubmitManyImpl` dibuja en serie calcula los **bloques de 256 B de la VRAM (direccion de swizzle exacta) que lee realmente** (rectangulo UV de los vertices, con margen de 1 texel, modos CLAMP/region, formato PSM de TEX0) y **que escribe realmente** (rectangulo XY recortado al scissor; mas ZBUF si se usa) y los
+compara con la prueba actual (intervalos de paginas); ademas simula el reparto en tramos con la prueba exacta (bloques leidos frente a escritos). Script: `scripts/g0_classify.sh [desde hasta tick_fin]`; logs en `work/g0/` (ignorado por git). Corrida: modo determinista, guion de `runner/README_DETERMINISTIC.md`, `build/blade/blade_recomp`
+(interprete puro), ventana oculta. En modo determinista el indice de Present va ~1650 por detras del tick desde el tick 2500: **Present 950-2250 = ticks ~2600-3900** (1 300 Present con dibujo); segunda corrida Present 1400-1500 = la ventana de M0-b (ticks ~3048-3150). Los ms son tiempo de pared del dibujo
+de esas primitivas en el hilo rasterizador (con 4 bandas paradas), medidos por primitiva con `steady_clock` (encarece algo; load average 2,7 y 3,2 al empezar, un poco por encima del 3 pedido en la segunda).
+
+### Hallazgo principal: la hipotesis de M0-b era falsa
+M0-b dijo «~8 000 primitivas en serie por VSync, todas por "textura solapa destino"». **No es asi.** Esas primitivas son casi todas **tramos pequeños** (<4 096 px en total, ~18-25 px por primitiva: particulas y sprites) que se dibujan en serie porque la llamada a `SubmitMany` acaba, no por solape. Por motivo de serie (primitivas por Present, media de ticks 2600-3900):
+| Motivo de serie | prim/Present | % de las prim en serie | ms/Present | % del tiempo serie | ¿Desaparece con prueba exacta? |
+|---|---|---|---|---|---|
+| **0 «destino/z solapados»** (intervalos de paginas de FRAME y ZBUF se tocan; no tiene que ver con texturas) | 3 742 | 35 % | 6,99 | **64,6 %** | **100 %**: 0 con bloques compartidos realmente (FRAME fbp=320 psm 0x00, ZBUF zbp=480 psm 0x3A, 640x512) |
+| **1 «textura solapa destino»** | 471 | 4,5 % | 2,77 | 25,6 % | 99,6 % (ver abajo) |
+| 2 «tramo pequeño» (<4 096 px) | 6 359 | 60 % | 1,06 | 9,8 % | **no**: 6 173 cortados por fin de `SubmitMany` (58 tramos/Present de ~106 prim), 158 por una textura que solapa, resto por cambio de FBP/Z |
+| **Total serie** | **10 572** | 100 % | **10,82** | 100 % | |
+Total de primitivas por Present: 36 583 (la ventana de M0-b, 29 127: ahi la serie son 6 757: 54 motivo 0 con 5,9 ms, 33 motivo 1 con 3,7 ms y 6 670 tramos pequeños con 1,1 ms: M0-b etiqueto como «textura solapa destino» el grueso, que es el motivo 2; el tiempo serie 10,7 ms/Present coincide con los 12 ms de pared de M0-b).
+Lo grave no es el numero (las 6 359 pequeñas son el 60 % de las primitivas y solo el 10 % del tiempo) sino el **tiempo**: el motivo 0 (3 742 prim de ~1 400 px) y unas 50 primitivas grandes de la cat. 0 (~25 000 px) suman el 89 % del tiempo serie.
+
+### Tabla G0: las 471 de «textura solapa destino» (ticks 2600-3900) por categoria
+| Cat. | Significado | prim/Present | ms/Present | % del tiempo serie | ¿Desaparece con G1-a (prueba exacta)? |
+|---|---|---|---|---|---|
+| (a) falso positivo | **0** ni comparten pagina (rangos de paginas solapan, rectangulos reales a >1 pagina) | 50 | 2,59 | 23,9 % | si, 100 % |
+| (a) falso positivo | 1 comparten pagina pero no bloque | 0 | 0 | 0 | — |
+| (a) falso positivo | 6 sin escritura: la primitiva cae fuera del scissor (no dibuja nada) | 419 | 0,02 | 0,2 % | si, 100 % (ni hace falta dibujarlas) |
+| (b) copia entre buffers distintos | 4 otro buffer, comparten bloques | 0 | 0 | 0 | — |
+| (c) realimentacion 1:1 (sprite lee su propio pixel) | 2 | <0,1 (5-6 px) | ~0 | ~0 | — (ya valdria «lectura del propio pixel»; no pesa) |
+| (d) solape real parcial | 3 mismo buffer, UV desplazado 3-6 px (sprites de 15x15 con ALPHA que leen el propio FRAME, `tbp`=`fbp`*32, TFX=1) | 2 | 0,16 | 1,5 % | **no**: es dependencia real |
+| (e) otro | 5 solo con el ZBUF / 7 UV sin rectangulo | 0 | 0 | 0 | — |
+| **Suma** | | **471** | **2,77** | **25,6 %** | **469 de 471 (99,6 %)**; con ellas, 2,61 ms |
+Ventana M0-b (ticks ~3048-3150): 33 prim/Present, 3,73 ms (16 de la cat. 0 con 3,72 ms, 14 sin escritura, 2 de la cat. 3 con 0,01 ms).
+
+Grupos que mas pesan (textura -> destino; rectangulo UV leido frente a rectangulo XY escrito, ejemplo):
+| Grupo | prim/Present | ms/Present | Rectangulos (ejemplo) |
+|---|---|---|---|
+| cat 0: TEX0 tbp=4096 PSMCT32 tbw=4 256x256 -> FRAME fbp=160 fbw=10 PSMCT32, ZBUF zbp=480 | 7,5 | 2,51 | UV [156,155]-[255,255] frente a XY [0,336]-[277,511]; ALPHA activo, TFX=0: **efecto de pantalla (post-proceso/«bloom»)**, 25 000 px por primitiva; la textura (256 KB) acaba exactamente donde empieza el FRAME: no comparten ni pagina |
+| cat 3: tbp=10240 (o 5120) PSMCT32 1024x512 (= el otro FRAME, 320*32 / 160*32) -> FRAME fbp=320 (o 160) | 0,8+0,8 | 0,08+0,08 | UV [25,134]-[28,137] frente a XY [20,129]-[34,143], 2 600 px: lectura del buffer propio con desplazamiento |
+| cat 0: tbp=1536 PSMT8 (psm 0x13) 512x256 -> fbp=160 | 0,5 | 0,04 | UV [0,0]-[511,255] frente a XY [240,0]-[639,460]: 1 M de pixeles por primitiva, 0,5 por Present (fondo/cielo): falso positivo por rangos |
+| cat 0: tbp=1536 PSMCT32 o PSMT8 128x128 -> fbp=160 o 320 (varios grupos) | ~50 | ~0,05 | sprites de 100-370 px |
+| cat 6: tbp=1536 128x128 -> fbp=160 | 417 | 0,02 | fuera del scissor (XY x>=374, y>=512) |
+El resto de grupos (top 40) esta en `work/g0/g0_950_2250.log`. Las 3 742 del motivo 0 son un solo grupo: FRAME fbp=320 / ZBUF zbp=480 psm 0x3A, 1 415 px/prim, 6,99 ms/Present; la prueba de paginas se queda corta porque FRAME y ZBUF se calculan «hasta la fila mas baja que toca la primitiva» y los intervalos se tocan sin compartir ningun bloque.
+
+### Simulacion con prueba exacta de bloques (solo textura; el motivo 0 sigue con la prueba de paginas)
+Serie: 10 572 -> **9 541 prim/Present** (1,37 Mpx); paralelo 26 011 -> 27 043 prim/Present (44,0 Mpx), 152 tramos paralelos/Present. (M0-b window: serie 6 757 -> 6 693.) La simulacion NO incluye aplicar tambien la prueba exacta al motivo 0 ni agrupar tramos pequeños entre llamadas.
+
+### Lo que se desprende
+1. **Aplicando la prueba exacta a «textura solapa destino» (G1-a como esta escrito) desaparece el 24 % del tiempo serie** (2,6 ms de 10,8 por Present), no la mayoria: son 469 primitivas pero pocas, muy grandes. Con 4 bandas el ahorro de pared es ~2,6x(1-1/4) = ~2 ms por VSync sobre ~35,5 aislados (~6 %: de ~28 a ~30 V/s de techo) **[H]**.
+2. **El grueso es el motivo 0** (65 % del tiempo serie, 3 742 prim, todas falsas): G1-a debe **incluir la prueba exacta FRAME/ZBUF** (bloques o, mas barato, filas exactas del rectangulo escrito en vez de «hasta la fila mas baja»). Con textura + FRAME/ZBUF exactos desaparece el **~89 % del tiempo serie** (9,6 ms de 10,8) y 4 211 de las 10 572 primitivas: ~7 ms de pared por VSync **[H]** (35,5 -> ~28 ms aislados: techo ~36 V/s, en la linea alta del 30-40 del plan).
+3. Lo que queda (6 359 tramos pequeños, 1,2 ms con la real parcial) **no es solape**: son particulas de ~20 px cortadas porque cada una de las 209 llamadas a `SubmitMany` por VSync acaba con un tramo corto. Solo se arregla juntando tramos entre llamadas (o con GPU, donde no importa).
+4. **Para G2 (barreras)**: realimentacion real (cat. 2, 3) = 2 primitivas/Present, copias entre buffers (cat. 4) = 0 y FRAME/ZBUF compartiendo bloques = 0. Es la rama optima de §0.5: el numero de barreras por «textura solapa destino» sale de decenas como mucho (2 de cat. 3 + cortes por cambio de FRAME/ZBUF), no de miles; las cat. 3 piden **copia previa del rango compartido** (regla 6 de la referencia), las de cat. 0 y 6 van sin barrera. Salvedad: solo se ha medido el nivel 1 (ticks 2600-3900); otras escenas pueden tener post-proceso con copia real.
+5. Cautela para G1-a: la prueba de bloques usada aqui (bitset de 16 384 bits por primitiva) es para medir, no para producir; para la CPU hace falta una prueba barata (rectangulos de paginas exactos) y verificarla con `PS2X_GS_AB=1` y `qa_regression.sh`.
+Comprobacion de que el modo normal no cambia: ver la linea de hashes del tick 3000 en la nota de G0 del plan.

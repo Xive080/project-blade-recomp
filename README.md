@@ -163,6 +163,8 @@ Propios:
   VSync con `BLADE_GS_PROBE_TICKS=desde,hasta`. `PS2X_VU1_KICKDUMP=carpeta` registra `[vu1kick]` por cada XGKICK
   del VU1 con la etiqueta GIF y vuelca hasta 4 copias del codigo y datos del VU1 de las que no llevan textura
   (`PS2X_VU1_KICKDUMP_PRIM=hex` elige un PRIM concreto). Con esto se encontro AB-017.
+- `ps2recomp-zzz-vu1-diffbench.patch` (herramienta, sin efecto sin `BLADE_VU1_DIFF`; solo toca `ps2_vu1_core.cpp`, sin cabeceras): banco
+  diferencial interprete contra implementacion compilada sobre grabaciones del VU1; ver `BLADE_VU1_DIFF` en Herramientas.
 - `ps2recomp-zz-guest-heap.patch`: el monticulo del juego (`SetupHeap(.., -1)`/`EndOfHeap`) acababa en 0x01F00000
   porque ahi vivian los pools HLE del runtime (paquetes y servidores RPC, TLS, modo de arranque, 0x01F00000-0x01F31000).
   En la consola el monticulo llega hasta la pila del hilo principal (AirBlade: 0x01FF8000). AirBlade lo llena casi
@@ -219,6 +221,27 @@ Herramientas propias (sin parche: `runner/blade_devtools.cpp`, solo se activan c
   igualdad; ver el informe de rendimiento.
 - `BLADE_VU1_REPLAY_REPEAT=N`: con `BLADE_VU1_REPLAY`, repite el fichero N veces para medir tiempos (solo se comparan
   los resultados de la primera pasada). La cache de pares decodificados funciona como en el juego.
+- `BLADE_VU1_DIFF=fichero[,pc=hex][,img=hex][,max=N][,show=N]` (parche `ps2recomp-zzz-vu1-diffbench.patch`, gancho en
+  `runner/blade_devtools.cpp`): **banco diferencial** del VU1, offline sobre una grabacion de `PS2X_VU1_RECORD` (sin arrancar el
+  juego; ~6 s para 30 000 llamadas). Por cada llamada ejecuta dos implementaciones desde el mismo estado inicial real (VF/VI/ACC/Q/P/I/R/
+  flags/pipelines, memoria de datos de 16 KB y microcodigo): **A** = interprete puro (referencia, ademas comprobada contra los hashes
+  grabados) y **B** = lo que se prueba: el despacho normal (microprogramas compilados si el build los tiene; si no, tambien el interprete)
+  o, con `BLADE_VU1_DIFF_B=interp`, el interprete forzado. Compara registros (campo y carril, bit a bit), ciclos, memoria de datos
+  completa y los paquetes GIF de salida (cuantos y el primer byte distinto con su etiqueta decodificada), imprime las primeras
+  `show` diferencias (5) y termina con codigo 0 solo si no hay ninguna. Ademas escribe la tabla de microprogramas (inventario por
+  contenido ejecutado y por (PC, imagen): llamadas, ciclos, % y diferencias). Filtros: `pc=` solo llamadas que entran/se reanudan en
+  ese PC (bytes, hex), `img=` solo esa imagen de 16 KB, `max=` para tras N comparadas. Para probar el propio banco,
+  `BLADE_VU1_DIFF_FAULT=<clase>[:<arg>]@<n>` corrompe la salida de B en la n-esima llamada comparada: `vf:R.L`, `vi:N`, `acc:L`,
+  `mac`, `status`, `clip`, `pc`, `cycles`, `mem:hex`, `gif`, `gifdrop`. Flujo:
+  1. grabar: `PS2X_VU1_NOGEN=1 PS2X_VU1_RECORD=work/vu1gen/nivel.rec,1300000,30000 BLADE_HIDDEN=1 BLADE_INPUT=<guion> blade_recomp disc/SCES_502.46`
+     (la llamada 1 300 000 cae hacia el VSync 2830; ~150 MB; `*.rec` y `work/vu1gen/` estan ignorados por git);
+  2. comparar: `BLADE_VU1_DIFF=work/vu1gen/nivel.rec build/blade/blade_recomp disc/SCES_502.46` (con `,pc=1810` para un microprograma);
+  3. demostracion de que detecta: `BLADE_VU1_DIFF_FAULT=vf:5.2@100 BLADE_VU1_DIFF=work/vu1gen/nivel.rec ...` debe salir con 1 y
+     nombrar `vf05.z`.
+  Para enchufar otra implementacion (otro recompilador) basta con que `VU1Interpreter::run` la elija cuando `g_vu1ForceInterp` es
+  falso: B es siempre "lo que elige `selectGenProgram`". Limitaciones: la inyeccion de fallos corrompe la salida de B (prueba el
+  comparador, no un compilador); solo vale para llamadas grabadas con el microcodigo de 16 KB del VU1; el contenido ejecutado se mide
+  con el interprete (A), asi que el inventario no ve los pares que A no pisa en esa muestra.
 - Microprogramas VU1 compilados (parche `ps2recomp-vu1-z-compiled.patch`). El C++ generado a partir del microcodigo del
   disco es codigo del juego: NO se versiona (`work/vu1gen/`, ignorado) y se produce desde tu propio disco:
   1. Graba llamadas del nivel con el interprete puro: `PS2X_VU1_NOGEN=1 PS2X_VU1_RECORD=work/vu1gen/nivel.rec,1500000,20000`

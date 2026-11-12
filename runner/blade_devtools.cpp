@@ -10,6 +10,7 @@
 //   BLADE_STATS=1                        escribe cada segundo real el VSync actual y los VSync por segundo
 //                                        ("[blade:stats] VSync N  V/s") y, justo antes, "[blade:frames]" con la media, el minimo y el p1% de
 //                                        los tiempos de fotograma de ese segundo; al salir, el total.
+//   BLADE_VU1_DIFF=fichero[,pc=hex][,img=hex][,max=N]  banco diferencial A (interprete) contra B (compilado) sobre una grabacion; sale.
 //   BLADE_VU1_REPLAY=fichero             reproduce y compara una grabacion del VU1 (PS2X_VU1_RECORD=fichero[,desde[,cuantas]]) y sale.
 //   BLADE_HIDDEN=1                       crea la ventana oculta y sin foco (pruebas en segundo plano; los volcados
 //                                        de marcos siguen funcionando porque leen la imagen del GS, no la ventana).
@@ -293,12 +294,16 @@ namespace
 
 int ps2xVu1Replay(const char *path); // third_party/PS2Recomp, ps2_vu1_core.cpp
 int ps2xVu1Gen(const char *spec);
+int ps2xVu1Diff(const char *spec); // banco diferencial (patch ps2recomp-zzz-vu1-diffbench)
 
 void bladeStartDevTools(PS2Runtime &runtime)
 {
     // BLADE_VU1_REPLAY=fichero: reproduce un fichero grabado con PS2X_VU1_RECORD, compara y sale (0 = identico).
     if (const char *replay = std::getenv("BLADE_VU1_REPLAY"); replay && *replay)
         std::exit(ps2xVu1Replay(replay));
+    // BLADE_VU1_DIFF=fichero[,pc=hex][,img=hex][,max=N][,show=N]: banco diferencial interprete contra implementacion compilada.
+    if (const char *diff = std::getenv("BLADE_VU1_DIFF"); diff && *diff)
+        std::exit(ps2xVu1Diff(diff));
     if (const char *gen = std::getenv("BLADE_VU1_GEN"); gen && *gen)
         std::exit(ps2xVu1Gen(gen));
     std::filesystem::path dumpDir;

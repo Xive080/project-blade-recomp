@@ -1,0 +1,516 @@
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -127,6 +127,10 @@
+ // vacias (las demas se cuentan como "no reproducibles").
+ // ---------------------------------------------------------------------------------------------------------
+ uint64_t g_vu1GenFallback = 0;
++// Banco diferencial (BLADE_VU1_DIFF): fuerza el interprete puro aunque haya microprogramas compilados.
++static bool g_vu1ForceInterp = false;
++// Banco diferencial: si no es nulo, el interprete marca en el los pares (PC >> 3) que ejecuta (inventario por contenido).
++static std::bitset<2048> *g_vu1Visit = nullptr;
+ 
+ struct VU1Internal
+ {
+@@ -171,6 +175,7 @@
+         bool suppress = false; // no los manda al GS (reproduccion)
+         uint64_t hash = 1469598103934665603ull;
+         uint32_t count = 0;
++        std::vector<std::vector<uint8_t>> *capture = nullptr; // banco diferencial: copia de cada paquete
+     };
+     GifTap g_gifTap;
+     // Reproduccion: sin PS2Memory no hay generacion de microcodigo; se usa este contador (sube al leer un 'C')
+@@ -485,6 +490,467 @@
+     std::printf("[vu1replay] pares ejecutados por el interprete dentro de microprogramas compilados: %llu\n", (unsigned long long)g_vu1GenFallback);
+     std::fflush(stdout);
+     return bad == 0 && ok > 0 ? 0 : 1;
++}
++
++// ---------------------------------------------------------------------------------------------------------
++// Banco diferencial del VU1 (BLADE_VU1_DIFF=fichero[,pc=hex][,img=hex][,max=N][,show=N] en el ejecutable del juego).
++// Reproduce un fichero grabado con PS2X_VU1_RECORD y, por cada llamada, ejecuta DOS implementaciones desde el mismo
++// estado inicial real (VF/VI/ACC/Q/P/I/R/flags/pipelines + memoria de datos + microcodigo):
++//   A = interprete puro (referencia; ademas se comprueba contra los hashes grabados, como BLADE_VU1_REPLAY),
++//   B = la implementacion a probar: el despacho normal (microprogramas compilados si existen; si no, el interprete)
++//       o, con BLADE_VU1_DIFF_B=interp, el interprete forzado.
++// Compara registros (campo y carril), ciclos, memoria de datos completa (16 KB) y los paquetes GIF de salida
++// (cuantos, y el primer byte distinto con su etiqueta decodificada). Al final imprime una tabla por microprograma
++// (punto de entrada + hash de la imagen de 16 KB): llamadas, ciclos y diferencias. Sale con 0 si no hay ninguna.
++// Filtros: pc=hex solo las llamadas que entran por ese PC (execute) o se reanudan en el (resume); img=hex solo esa
++// imagen; max=N para tras N llamadas comparadas; show=N cuantas diferencias detalla (5 por defecto).
++// Inyeccion de fallo (para probar el propio banco): BLADE_VU1_DIFF_FAULT=<clase>[:<arg>]@<n> corrompe la salida de B
++// en la n-esima llamada comparada: vf:R.L (bit 0 del carril L de VF R), vi:N, acc:L, mac, status, clip, pc, cycles,
++// mem:hex (un bit de la direccion de la memoria de datos), gif (un bit del primer paquete) o gifdrop (quita el ultimo).
++// ---------------------------------------------------------------------------------------------------------
++namespace
++{
++    struct DiffProg
++    {
++        uint64_t calls = 0, cycles = 0, compared = 0, badAB = 0, badRec = 0;
++        std::bitset<2048> visited; // pares ejecutados por A en todas las llamadas de esta fila
++    };
++
++    inline uint32_t f2u(float f)
++    {
++        uint32_t u;
++        std::memcpy(&u, &f, 4);
++        return u;
++    }
++
++    std::string diffStates(const VU1State &a, const VU1State &b)
++    {
++        std::string out;
++        int n = 0;
++        char buf[200];
++        auto add = [&](const char *name, uint64_t x, uint64_t y)
++        {
++            if (x == y || n >= 8)
++                return;
++            ++n;
++            std::snprintf(buf, sizeof(buf), " %s A=%llx B=%llx;", name, (unsigned long long)x, (unsigned long long)y);
++            out += buf;
++        };
++        for (int r = 0; r < 32; ++r)
++            for (int l = 0; l < 4; ++l)
++                if (f2u(a.vf[r][l]) != f2u(b.vf[r][l]))
++                {
++                    char nm[16];
++                    std::snprintf(nm, sizeof(nm), "vf%02d.%c", r, "xyzw"[l]);
++                    add(nm, f2u(a.vf[r][l]), f2u(b.vf[r][l]));
++                }
++        for (int r = 0; r < 16; ++r)
++        {
++            char nm[16];
++            std::snprintf(nm, sizeof(nm), "vi%02d", r);
++            add(nm, (uint32_t)a.vi[r], (uint32_t)b.vi[r]);
++        }
++        for (int l = 0; l < 4; ++l)
++        {
++            char nm[16];
++            std::snprintf(nm, sizeof(nm), "acc.%c", "xyzw"[l]);
++            add(nm, f2u(a.acc[l]), f2u(b.acc[l]));
++        }
++        add("q", f2u(a.q), f2u(b.q));
++        add("p", f2u(a.p), f2u(b.p));
++        add("i", f2u(a.i), f2u(b.i));
++        add("r", a.r, b.r);
++        add("pc", a.pc, b.pc);
++        add("mac", a.mac, b.mac);
++        add("clip", a.clip, b.clip);
++        add("status", a.status, b.status);
++        add("ebit", a.ebit, b.ebit);
++        add("haltAfterDelaySlot", a.haltAfterDelaySlot, b.haltAfterDelaySlot);
++        add("dEn", a.dBitEnabled, b.dBitEnabled);
++        add("tEn", a.tBitEnabled, b.tBitEnabled);
++        add("stoppedByD", a.stoppedByD, b.stoppedByD);
++        add("stoppedByT", a.stoppedByT, b.stoppedByT);
++        add("top", a.top, b.top);
++        add("itop", a.itop, b.itop);
++        add("branchPending", a.branchPending, b.branchPending);
++        add("branchTarget", a.branchTarget, b.branchTarget);
++        add("branchDelay", a.branchDelay, b.branchDelay);
++        return out;
++    }
++
++    std::string gifTag(const std::vector<uint8_t> &p)
++    {
++        if (p.size() < 16)
++            return "(paquete < 16 bytes)";
++        uint64_t lo;
++        std::memcpy(&lo, p.data(), 8);
++        char buf[160];
++        std::snprintf(buf, sizeof(buf), "tag NLOOP=%u EOP=%u PRE=%u PRIM=%03x FLG=%u NREG=%u, %zu bytes", (unsigned)(lo & 0x7FFF),
++                      (unsigned)((lo >> 15) & 1), (unsigned)((lo >> 46) & 1), (unsigned)((lo >> 47) & 0x7FF),
++                      (unsigned)((lo >> 58) & 3), (unsigned)((lo >> 60) & 15), p.size());
++        return buf;
++    }
++
++    // Aplica a la salida de B el fallo pedido; devuelve false si la clase no existe.
++    bool injectFault(const std::string &kind, VU1State &st, uint64_t &cyc, std::vector<uint8_t> &data,
++                     std::vector<std::vector<uint8_t>> &pk)
++    {
++        const size_t colon = kind.find(':');
++        const std::string k = kind.substr(0, colon);
++        const std::string arg = colon == std::string::npos ? std::string() : kind.substr(colon + 1);
++        auto flip = [](float &f)
++        {
++            uint32_t u = f2u(f) ^ 1u;
++            std::memcpy(&f, &u, 4);
++        };
++        if (k == "vf")
++        {
++            const unsigned r = std::strtoul(arg.c_str(), nullptr, 10) & 31u;
++            const size_t dot = arg.find('.');
++            const unsigned l = (dot == std::string::npos ? 0u : std::strtoul(arg.c_str() + dot + 1, nullptr, 10)) & 3u;
++            flip(st.vf[r][l]);
++        }
++        else if (k == "vi")
++            st.vi[std::strtoul(arg.c_str(), nullptr, 10) & 15u] ^= 1;
++        else if (k == "acc")
++            flip(st.acc[std::strtoul(arg.c_str(), nullptr, 10) & 3u]);
++        else if (k == "mac")
++            st.mac ^= 1u;
++        else if (k == "status")
++            st.status ^= 1u;
++        else if (k == "clip")
++            st.clip ^= 1u;
++        else if (k == "pc")
++            st.pc ^= 8u;
++        else if (k == "cycles")
++            cyc += 1;
++        else if (k == "mem")
++            data[std::strtoul(arg.c_str(), nullptr, 16) % data.size()] ^= 1u;
++        else if (k == "gif")
++        {
++            if (pk.empty() || pk[0].empty())
++                pk.push_back(std::vector<uint8_t>(16, 0u));
++            else
++                pk[0][std::min<size_t>(16, pk[0].size() - 1)] ^= 1u;
++        }
++        else if (k == "gifdrop")
++        {
++            if (!pk.empty())
++                pk.pop_back();
++        }
++        else
++            return false;
++        return true;
++    }
++}
++
++int ps2xVu1Diff(const char *spec)
++{
++    std::vector<std::string> parts;
++    {
++        std::string sp(spec), cur;
++        for (char c : sp)
++        {
++            if (c == ',')
++            {
++                parts.push_back(cur);
++                cur.clear();
++            }
++            else
++                cur += c;
++        }
++        parts.push_back(cur);
++    }
++    const std::string path = parts[0];
++    bool hasPc = false, hasImg = false;
++    uint32_t pcSel = 0;
++    uint64_t imgSel = 0, maxCmp = ~0ull, show = 5;
++    for (size_t i = 1; i < parts.size(); ++i)
++    {
++        const std::string &o = parts[i];
++        if (o.rfind("pc=", 0) == 0)
++            hasPc = true, pcSel = static_cast<uint32_t>(std::strtoul(o.c_str() + 3, nullptr, 16));
++        else if (o.rfind("img=", 0) == 0)
++            hasImg = true, imgSel = std::strtoull(o.c_str() + 4, nullptr, 16);
++        else if (o.rfind("max=", 0) == 0)
++            maxCmp = std::strtoull(o.c_str() + 4, nullptr, 10);
++        else if (o.rfind("show=", 0) == 0)
++            show = std::strtoull(o.c_str() + 5, nullptr, 10);
++        else
++        {
++            std::fprintf(stderr, "[vu1diff] opcion desconocida: %s\n", o.c_str());
++            return 2;
++        }
++    }
++    const char *bEnv = std::getenv("BLADE_VU1_DIFF_B");
++    const bool bForceInterp = bEnv && std::string(bEnv) == "interp";
++    std::string faultKind;
++    uint64_t faultAt = 0;
++    if (const char *fe = std::getenv("BLADE_VU1_DIFF_FAULT"); fe && *fe)
++    {
++        std::string f(fe);
++        const size_t at = f.find('@');
++        faultKind = f.substr(0, at);
++        faultAt = at == std::string::npos ? 1 : std::strtoull(f.c_str() + at + 1, nullptr, 10);
++    }
++
++    FILE *f = std::fopen(path.c_str(), "rb");
++    if (!f)
++    {
++        std::fprintf(stderr, "[vu1diff] no se puede abrir %s\n", path.c_str());
++        return 2;
++    }
++    char magic[8];
++    uint32_t sizes[2];
++    if (std::fread(magic, 1, 8, f) != 8 || std::memcmp(magic, "VU1REC01", 8) != 0 || std::fread(sizes, sizeof(sizes), 1, f) != 1)
++    {
++        std::fprintf(stderr, "[vu1diff] formato no valido\n");
++        return 2;
++    }
++    VU1Interpreter implA(VU1Interpreter::Unit::VU1), implB(VU1Interpreter::Unit::VU1);
++    GS gs;
++    std::vector<uint8_t> code(sizes[0], 0u), dataA(sizes[1], 0u), dataB(sizes[1], 0u);
++    uint64_t imgHash = 0;
++    std::map<uint64_t, std::vector<uint8_t>> images; // una copia del microcodigo por imagen distinta
++    g_gifTap.hashing = true;
++    g_gifTap.suppress = true;
++    g_replayCache = true;
++    std::map<std::pair<uint32_t, uint64_t>, DiffProg> progs; // (PC | reanudacion << 16, imagen)
++    uint64_t calls = 0, cmpCalls = 0, badAB = 0, badRec = 0, detailed = 0, faultsInjected = 0;
++    const auto t0 = std::chrono::steady_clock::now();
++    for (;;)
++    {
++        uint8_t tag = 0;
++        if (std::fread(&tag, 1, 1, f) != 1)
++            break;
++        if (tag == 'C')
++        {
++            if (std::fread(code.data(), 1, code.size(), f) != code.size())
++                break;
++            ++g_replayGen;
++            imgHash = fnvWords(code.data(), code.size());
++            images.emplace(imgHash, code);
++            continue;
++        }
++        if (tag != 'K')
++            break;
++        uint8_t kind = 0;
++        uint32_t a[4];
++        VU1State pre{}, post{};
++        uint32_t changed = 0;
++        bool good = std::fread(&kind, 1, 1, f) == 1 && std::fread(a, sizeof(a), 1, f) == 1 && std::fread(&pre, sizeof(pre), 1, f) == 1 &&
++                    std::fread(&changed, sizeof(changed), 1, f) == 1;
++        for (uint32_t i = 0; good && i < changed; ++i)
++        {
++            uint16_t idx = 0;
++            good = std::fread(&idx, sizeof(idx), 1, f) == 1 && (idx + 1u) * kRecChunk <= dataA.size() &&
++                   std::fread(dataA.data() + idx * kRecChunk, 1, kRecChunk, f) == kRecChunk;
++        }
++        uint64_t cyc = 0, dataHash = 0, gifHash = 0;
++        uint8_t clean = 0;
++        uint32_t gifCount = 0;
++        good = good && std::fread(&post, sizeof(post), 1, f) == 1 && std::fread(&cyc, sizeof(cyc), 1, f) == 1 &&
++               std::fread(&clean, 1, 1, f) == 1 && std::fread(&dataHash, sizeof(dataHash), 1, f) == 1 &&
++               std::fread(&gifHash, sizeof(gifHash), 1, f) == 1 && std::fread(&gifCount, sizeof(gifCount), 1, f) == 1;
++        if (!good)
++            break;
++        ++calls;
++        const uint32_t entryPc = (kind == 0 ? a[0] : pre.pc) & 0x3FFFu;
++        const bool selected = (!hasPc || entryPc == pcSel) && (!hasImg || imgHash == imgSel) && cmpCalls < maxCmp;
++
++        // Estado inicial identico para A y B (la memoria de datos de A es la cadena de referencia).
++        dataB = dataA;
++        std::vector<std::vector<uint8_t>> pkA, pkB;
++        implA.state() = pre;
++        VU1Internal::prepareReplay(implA);
++        g_vu1ForceInterp = true;
++        std::bitset<2048> visited;
++        g_vu1Visit = &visited;
++        g_gifTap.capture = &pkA;
++        g_gifTap.hash = 1469598103934665603ull;
++        g_gifTap.count = 0;
++        const uint64_t cA0 = VU1Internal::cycle(implA);
++        if (kind == 0)
++            implA.execute(code.data(), sizes[0], dataA.data(), sizes[1], gs, nullptr, a[0], a[1], a[2], a[3]);
++        else
++            implA.resume(code.data(), sizes[0], dataA.data(), sizes[1], gs, nullptr, a[1], a[2], a[3]);
++        g_vu1Visit = nullptr;
++        const uint64_t cycA = VU1Internal::cycle(implA) - cA0;
++        const uint64_t hashA = g_gifTap.hash;
++        const uint32_t countA = g_gifTap.count;
++
++        implB.state() = pre;
++        VU1Internal::prepareReplay(implB);
++        g_vu1ForceInterp = bForceInterp;
++        g_gifTap.capture = &pkB;
++        const uint64_t cB0 = VU1Internal::cycle(implB);
++        if (kind == 0)
++            implB.execute(code.data(), sizes[0], dataB.data(), sizes[1], gs, nullptr, a[0], a[1], a[2], a[3]);
++        else
++            implB.resume(code.data(), sizes[0], dataB.data(), sizes[1], gs, nullptr, a[1], a[2], a[3]);
++        uint64_t cycB = VU1Internal::cycle(implB) - cB0;
++        g_gifTap.capture = nullptr;
++        g_vu1ForceInterp = false;
++
++        // A contra lo grabado (solo llamadas limpias, como el replay): valida que A reproduce el juego.
++        const char *fieldRec = "";
++        const bool recOk = !clean || (sameState(implA.state(), post, fieldRec) && cycA == cyc &&
++                                      fnvWords(dataA.data(), dataA.size()) == dataHash && hashA == gifHash && countA == gifCount);
++        DiffProg &pg = progs[{entryPc | (kind ? 0x10000u : 0u), imgHash}];
++        ++pg.calls;
++        pg.cycles += cycA;
++        pg.visited |= visited;
++        if (!selected)
++            continue;
++        ++cmpCalls;
++        ++pg.compared;
++        VU1State stB = implB.state();
++        if (!faultKind.empty() && cmpCalls == faultAt)
++        {
++            if (!injectFault(faultKind, stB, cycB, dataB, pkB))
++            {
++                std::fprintf(stderr, "[vu1diff] clase de fallo desconocida: %s\n", faultKind.c_str());
++                return 2;
++            }
++            ++faultsInjected;
++        }
++        if (!recOk)
++        {
++            ++badRec;
++            ++pg.badRec;
++            if (detailed < show)
++                std::fprintf(stderr, "[vu1diff] llamada %llu: A (interprete) NO reproduce lo grabado (campo %s)\n", (unsigned long long)calls,
++                             fieldRec);
++        }
++        // A contra B
++        const std::string stDiff = diffStates(implA.state(), stB);
++        const bool cycDiff = cycA != cycB;
++        size_t memDiffs = 0, firstMem = 0;
++        for (size_t i = 0; i < dataA.size(); ++i)
++            if (dataA[i] != dataB[i])
++            {
++                if (!memDiffs)
++                    firstMem = i;
++                ++memDiffs;
++            }
++        std::string gifDiff;
++        if (pkA.size() != pkB.size())
++        {
++            char b[96];
++            std::snprintf(b, sizeof(b), " numero de paquetes A=%zu B=%zu;", pkA.size(), pkB.size());
++            gifDiff += b;
++        }
++        for (size_t i = 0; i < std::min(pkA.size(), pkB.size()); ++i)
++            if (pkA[i] != pkB[i])
++            {
++                size_t off = 0;
++                while (off < pkA[i].size() && off < pkB[i].size() && pkA[i][off] == pkB[i][off])
++                    ++off;
++                char b[260];
++                std::snprintf(b, sizeof(b), " paquete %zu distinto (byte %zu; tamanos A=%zu B=%zu; A %s);", i, off, pkA[i].size(),
++                              pkB[i].size(), gifTag(pkA[i]).c_str());
++                gifDiff += b;
++                break;
++            }
++        if (stDiff.empty() && !cycDiff && !memDiffs && gifDiff.empty())
++            continue;
++        ++badAB;
++        ++pg.badAB;
++        if (detailed++ < show)
++        {
++            std::fprintf(stderr, "[vu1diff] DIFERENCIA en la llamada %llu (%s, PC 0x%04x, imagen %016llx):\n", (unsigned long long)calls,
++                         kind == 0 ? "execute" : "resume", entryPc, (unsigned long long)imgHash);
++            if (!stDiff.empty())
++                std::fprintf(stderr, "    registros:%s\n", stDiff.c_str());
++            if (cycDiff)
++                std::fprintf(stderr, "    ciclos: A=%llu B=%llu\n", (unsigned long long)cycA, (unsigned long long)cycB);
++            if (memDiffs)
++                std::fprintf(stderr, "    memoria de datos: %zu bytes distintos; primero en 0x%04zx (qword 0x%03zx): A=%02x B=%02x\n", memDiffs,
++                             firstMem, firstMem / 16, dataA[firstMem], dataB[firstMem]);
++            if (!gifDiff.empty())
++                std::fprintf(stderr, "    paquetes GIF:%s\n", gifDiff.c_str());
++        }
++    }
++    std::fclose(f);
++    g_gifTap.hashing = false;
++    g_gifTap.suppress = false;
++    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
++
++    // Tabla por microprograma, ordenada por ciclos.
++    std::vector<std::pair<std::pair<uint32_t, uint64_t>, DiffProg>> rows(progs.begin(), progs.end());
++    std::sort(rows.begin(), rows.end(), [](const auto &x, const auto &y) { return x.second.cycles > y.second.cycles; });
++    uint64_t totalCyc = 0, distinctExec = 0;
++    for (const auto &r : rows)
++    {
++        totalCyc += r.second.cycles;
++        if (!(r.first.first & 0x10000u))
++            ++distinctExec;
++    }
++    // Inventario por contenido: un microprograma es (PC de entrada, codigo de los pares que de verdad se ejecutan);
++    // imagenes de 16 KB distintas que solo difieren fuera de esos pares cuentan como el mismo microprograma.
++    {
++        std::map<uint32_t, std::bitset<2048>> unionByEntry;
++        for (const auto &r : rows)
++            unionByEntry[r.first.first] |= r.second.visited;
++        struct Merged
++        {
++            uint64_t calls = 0, cycles = 0;
++            size_t images = 0, pairs = 0;
++        };
++        std::map<std::pair<uint32_t, uint64_t>, Merged> merged;
++        for (const auto &r : rows)
++        {
++            const auto &u = unionByEntry[r.first.first];
++            uint64_t h = 1469598103934665603ull;
++            const auto it = images.find(r.first.second);
++            if (it != images.end())
++                for (size_t i = 0; i < 2048; ++i)
++                    if (u[i])
++                        h = fnvBytes(h, it->second.data() + i * 8, 8);
++            Merged &m = merged[{r.first.first, h}];
++            m.calls += r.second.calls;
++            m.cycles += r.second.cycles;
++            ++m.images;
++            m.pairs = u.count();
++        }
++        std::vector<std::pair<std::pair<uint32_t, uint64_t>, Merged>> mrows(merged.begin(), merged.end());
++        std::sort(mrows.begin(), mrows.end(), [](const auto &x, const auto &y) { return x.second.cycles > y.second.cycles; });
++        uint64_t mc = 0, acc = 0;
++        for (const auto &m : mrows)
++            mc += m.second.cycles;
++        std::printf("[vu1diff] microprogramas distintos por contenido ejecutado: %zu (PC de entrada, hash del codigo ejecutado)\n", mrows.size());
++        std::printf("[vu1diff]   PC     hash codigo       imagenes  pares   llamadas       ciclos      %%  acumulado\n");
++        for (size_t i = 0; i < mrows.size() && i < 40; ++i)
++        {
++            const auto &m = mrows[i];
++            acc += m.second.cycles;
++            std::printf("[vu1diff]  %s%04x  %016llx %7zu %6zu %10llu %12llu %5.1f %6.1f\n", (m.first.first & 0x10000u) ? "r" : " ",
++                        m.first.first & 0xFFFFu, (unsigned long long)m.first.second, m.second.images, m.second.pairs,
++                        (unsigned long long)m.second.calls, (unsigned long long)m.second.cycles,
++                        100.0 * m.second.cycles / std::max<uint64_t>(1, mc), 100.0 * acc / std::max<uint64_t>(1, mc));
++        }
++    }
++    std::printf("[vu1diff] microprogramas (entrada, imagen): %zu filas, %llu con execute; r = reanudacion (resume)\n", rows.size(),
++                (unsigned long long)distinctExec);
++    std::printf("[vu1diff]   PC     imagen            llamadas       ciclos      %%  comparadas  A!=B  A!=grabado\n");
++    size_t shown = 0;
++    for (const auto &r : rows)
++    {
++        if (shown++ >= 40)
++            break;
++        std::printf("[vu1diff]  %s%04x  %016llx %9llu %12llu %5.1f %10llu %5llu %6llu\n", (r.first.first & 0x10000u) ? "r" : " ",
++                    r.first.first & 0xFFFFu, (unsigned long long)r.first.second, (unsigned long long)r.second.calls,
++                    (unsigned long long)r.second.cycles, 100.0 * r.second.cycles / std::max<uint64_t>(1, totalCyc),
++                    (unsigned long long)r.second.compared, (unsigned long long)r.second.badAB, (unsigned long long)r.second.badRec);
++    }
++    std::printf("[vu1diff] B = %s%s; %llu llamadas leidas, %llu comparadas, %llu con diferencias A!=B, %llu donde A no reproduce lo grabado, "
++                "%llu fallos inyectados; %.2f s\n",
++                bForceInterp ? "interprete forzado" : "despacho normal (compilado si existe)",
++                (!bForceInterp && vu1GenProgram() == nullptr) ? " [sin microprogramas compilados: B tambien es el interprete]" : "",
++                (unsigned long long)calls, (unsigned long long)cmpCalls, (unsigned long long)badAB, (unsigned long long)badRec,
++                (unsigned long long)faultsInjected, secs);
++    std::fflush(stdout);
++    return (badAB == 0 && badRec == 0 && cmpCalls > 0) ? 0 : 1;
+ }
+ 
+ // BLADE_VU1_GEN=<grabacion.rec>:<carpeta de salida>:<lo>-<hi> (tramo de microcodigo en bytes, hex): genera los
+@@ -1391,6 +1857,8 @@
+     {
+         g_gifTap.hash = fnvBytes(g_gifTap.hash, m_xgkick.packet.data(), m_xgkick.totalBytes) ^ (static_cast<uint64_t>(m_xgkick.totalBytes) << 32);
+         ++g_gifTap.count;
++        if (g_gifTap.capture)
++            g_gifTap.capture->emplace_back(m_xgkick.packet.data(), m_xgkick.packet.data() + m_xgkick.totalBytes);
+         if (g_gifTap.suppress)
+         {
+             m_xgkick.active = false;
+@@ -2069,7 +2537,7 @@
+ const VU1GenProgram *VU1Interpreter::selectGenProgram(const uint8_t *vuCode, uint32_t, const PS2Memory *memory)
+ {
+     static const bool disabled = [] { const char *e = std::getenv("PS2X_VU1_NOGEN"); return e && *e && *e != '0'; }();
+-    if (disabled || m_unit != Unit::VU1)
++    if (disabled || g_vu1ForceInterp || m_unit != Unit::VU1)
+         return nullptr;
+     if (!g_replayCache && !(memory != nullptr && vuCode == memory->getVU1Code()))
+         return nullptr;
+@@ -2125,6 +2593,8 @@
+ 
+         if (g_vu1Prof.on && m_unit == Unit::VU1)
+             g_vu1Prof.current.set((m_state.pc >> 3) & 2047u);
++        if (g_vu1Visit != nullptr && m_unit == Unit::VU1)
++            g_vu1Visit->set((m_state.pc >> 3) & 2047u);
+         const DecodedInstructionPair &decoded = getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
+         if (!stepPairT<false>(decoded, vuCode, vuData, dataSize, gs, memory, codeSize, budgetEnd, programEnded))
+             break;

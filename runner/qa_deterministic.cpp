@@ -4,8 +4,10 @@
 //   BLADE_DET_DUMP=carpeta,cada_N[,desde]      PNG del fotograma presentado en ese VBlank (con hash)
 //   BLADE_DET_HASH=cada_N[,desde]              hash FNV-1a de la RAM del EE (32 MB) y del fotograma
 //   BLADE_DET_EXIT=N                           termina en el VBlank N
+//   BLADE_GS_PROBE_TICKS=desde,hasta           con PS2X_GS_PROBE="x,y[;x,y]": lista las primitivas del GS que cubren esos pixeles
 #include "ps2_runtime.h"
 #include "raylib.h"
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -16,6 +18,7 @@
 #include <vector>
 
 extern void (*ps2xQaVSyncHook)(PS2Runtime &, uint64_t);
+extern std::atomic<uint64_t> g_ps2xGsProbeTick; // gs_cpu_backend.cpp: sonda de pixel (PS2X_GS_PROBE)
 
 unsigned long long gBladeQaTick = 0; // VBlank actual, para trazas de depuracion de otros ficheros del runner
 
@@ -32,6 +35,7 @@ namespace
     std::filesystem::path gDumpDir;
     uint64_t gDumpEvery = 0, gDumpFrom = 0, gHashEvery = 0, gHashFrom = 0, gExit = 0;
     bool gPadOn = false;
+    uint64_t gProbeFrom = 0, gProbeTo = 0;
 
     uint16_t bit(const std::string &n)
     {
@@ -75,6 +79,8 @@ namespace
     void hook(PS2Runtime &rt, uint64_t tick)
     {
         gBladeQaTick = tick;
+        if (gProbeTo)
+            g_ps2xGsProbeTick.store(tick >= gProbeFrom && tick <= gProbeTo ? tick : 0u, std::memory_order_relaxed);
         uint16_t mask = 0; uint8_t lx = 0x80, ly = 0x80; bool any = false;
         for (const Step &s : gSteps)
             if (tick >= s.start && tick < s.end)
@@ -133,6 +139,13 @@ namespace
                 gHashEvery = std::strtoull(v.c_str(), nullptr, 10); if (a != std::string::npos) gHashFrom = std::strtoull(v.c_str() + a + 1, nullptr, 10);
             }
             if (ex && *ex) gExit = std::strtoull(ex, nullptr, 10);
+            // BLADE_GS_PROBE_TICKS=desde,hasta: ventana de VSync de la sonda de pixel del GS (PS2X_GS_PROBE="x,y;...")
+            if (const char *pr = std::getenv("BLADE_GS_PROBE_TICKS"); pr && *pr)
+            {
+                gProbeFrom = std::strtoull(pr, nullptr, 10);
+                const char *c = std::strchr(pr, ',');
+                gProbeTo = c ? std::strtoull(c + 1, nullptr, 10) : gProbeFrom;
+            }
             ps2xQaVSyncHook = hook;
         }
     } gInit;

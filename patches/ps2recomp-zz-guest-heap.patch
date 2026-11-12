@@ -1,0 +1,95 @@
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index 4b9242c..263804c 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -219,6 +219,13 @@ inline void setReturnU64(R5900Context *ctx, uint64_t value)
+     ctx->r[3] = _mm_set_epi64x(0, static_cast<int64_t>(static_cast<uint32_t>(value >> 32)));
+ }
+ 
++// Final del monticulo del juego (SetupHeap/EndOfHeap) y suelo de las pilas de callbacks del runtime, que bajan
++// desde el final de la RAM. En la consola el monticulo llega hasta la pila del hilo principal; aqui se dejan 512 KB
++// para esa pila y las de callbacks. Antes era 0x01F00000 (los pools HLE vivian ahi; ahora estan en la RAM del kernel,
++// ver kRpcPacketPoolBase) y los juegos que llenan el monticulo (AirBlade: raster de la sombra, 256 KB) se quedaban
++// sin memoria donde la consola aun tiene ~1 MB.
++inline constexpr uint32_t PS2_GUEST_HEAP_HARD_LIMIT = 0x01F80000u;
++
+ inline constexpr uint32_t PS2_PATH_WATCH_ADDR = 0x01EFFFA0u;
+ inline constexpr uint32_t PS2_PATH_WATCH_BYTES = 0x200u;
+ 
+@@ -513,7 +520,7 @@ private:
+     uint32_t m_guestHeapLimit = PS2_RAM_SIZE;
+     uint32_t m_guestHeapSuggestedBase = 0x00100000u;
+     bool m_guestHeapConfigured = false;
+-    uint32_t m_asyncCallbackStackFloor = 0x01F00000u;
++    uint32_t m_asyncCallbackStackFloor = PS2_GUEST_HEAP_HARD_LIMIT;
+     uint32_t m_asyncCallbackStackTop = PS2_RAM_SIZE;
+ 
+     std::atomic<uint32_t> m_missingFunctionPolicy{static_cast<uint32_t>(MissingFunctionPolicy::ContinueToTarget)};
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h b/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h
+index d6b7549..a25a69a 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h
+@@ -242,21 +242,24 @@ inline std::filesystem::path g_host_cwd;
+ inline std::filesystem::path g_cdrom_cwd;
+ inline std::string g_ps2_cwd_device = "host0";
+ 
++// Pools HLE en la RAM del kernel del EE (0x80000-0xB1000): en la consola es memoria del kernel y los ELF de usuario
++// cargan desde 0x100000, asi que no la usa el juego. Antes estaban en 0x01F00000-0x01F31000, dentro del monticulo que la
++// consola le da al juego, y obligaban a cortar el monticulo ahi (ver PS2_GUEST_HEAP_HARD_LIMIT).
+ static constexpr uint32_t kRpcPacketSize = 64;
+-static constexpr uint32_t kRpcPacketPoolBase = 0x01F00000;
++static constexpr uint32_t kRpcPacketPoolBase = 0x00080000;
+ static constexpr uint32_t kRpcPacketPoolBytes = 0x00010000;
+ static constexpr uint32_t kRpcPacketPoolCount = kRpcPacketPoolBytes / kRpcPacketSize;
+-static constexpr uint32_t kRpcServerPoolBase = 0x01F10000;
++static constexpr uint32_t kRpcServerPoolBase = 0x00090000;
+ static constexpr uint32_t kRpcServerPoolBytes = 0x00010000;
+ static constexpr uint32_t kRpcServerStride = 0x80;
+ static constexpr uint32_t kRpcServerPoolCount = kRpcServerPoolBytes / kRpcServerStride;
+ 
+-static constexpr uint32_t kTlsPoolBase = 0x01F20000;
++static constexpr uint32_t kTlsPoolBase = 0x000A0000;
+ static constexpr uint32_t kTlsPoolBytes = 0x00010000;
+ static constexpr uint32_t kTlsBlockSize = 0x100;
+ static constexpr uint32_t kTlsPoolCount = kTlsPoolBytes / kTlsBlockSize;
+ 
+-static constexpr uint32_t kBootModePoolBase = 0x01F30000;
++static constexpr uint32_t kBootModePoolBase = 0x000B0000;
+ static constexpr uint32_t kBootModePoolBytes = 0x00001000;
+ 
+ static constexpr uint32_t kSifRpcModeNowait = 0x01;
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+index b985557..8c86928 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -546,7 +546,7 @@ namespace ps2_syscalls
+         const uint32_t heapBase = (heapBaseRaw + 0xFu) & ~0xFu;
+ 
+         // Silent Hill and other games often pass -1 (0xFFFFFFFF) to mean "rest of RAM".
+-        static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
++        static constexpr uint32_t kDefaultGuestHeapEnd = PS2_GUEST_HEAP_HARD_LIMIT;
+         uint32_t heapLimit = kDefaultGuestHeapEnd;
+ 
+         if (heapSize != 0u && heapSize != 0xFFFFFFFFu)
+@@ -586,7 +586,7 @@ namespace ps2_syscalls
+     {
+         (void)rdram;
+ 
+-        static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
++        static constexpr uint32_t kDefaultGuestHeapEnd = PS2_GUEST_HEAP_HARD_LIMIT;
+ 
+         const uint32_t ret = runtime
+                                  ? runtime->guestHeapLimit()
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 32a238b..e000528 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -90,7 +90,7 @@ namespace
+     constexpr uint32_t kGuestHeapDefaultBase = 0x00100000u;
+     constexpr uint32_t kGuestHeapDefaultAlignment = 16u;
+     constexpr uint32_t kGuestHeapSafetyPad = 0x1000u;
+-    constexpr uint32_t kGuestHeapHardLimit = 0x01F00000u;
++    constexpr uint32_t kGuestHeapHardLimit = PS2_GUEST_HEAP_HARD_LIMIT;
+ 
+     constexpr uint32_t COP0_CAUSE_EXCCODE_MASK = 0x0000007Cu;
+     constexpr uint32_t COP0_CAUSE_BD = 0x80000000u;

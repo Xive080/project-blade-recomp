@@ -157,6 +157,20 @@ Propios:
   `spu2_dsp.h` con tests (`ps2_iop_spu2_dsp_tests`, `ps2_iop_spu2_mix_tests`). Depuracion: `PS2X_SPU_TRACE=fichero`,
   `PS2X_SPU_REVERB=0`, `PS2X_SPU_RAMDUMP=fichero`, `PS2X_SPU_MASTER=strict`. Estado y desviaciones en
   `docs/AUDIO_IMPLEMENTATION_STATUS.md`.
+- `ps2recomp-zz-gs-probe.patch` (solo depuracion, sin efecto si no se definen las variables): `PS2X_GS_PROBE="x,y[;x,y]"`
+  (hasta 4 pixeles) escribe una linea `[gsprobe]` por cada primitiva del GS que cubre esos pixeles (PRIM, TEX0, ALPHA,
+  TEST, color, framebuffer antes/despues) mientras `g_ps2xGsProbeTick` no sea 0; el runner lo limita a una ventana de
+  VSync con `BLADE_GS_PROBE_TICKS=desde,hasta`. `PS2X_VU1_KICKDUMP=carpeta` registra `[vu1kick]` por cada XGKICK
+  del VU1 con la etiqueta GIF y vuelca hasta 4 copias del codigo y datos del VU1 de las que no llevan textura
+  (`PS2X_VU1_KICKDUMP_PRIM=hex` elige un PRIM concreto). Con esto se encontro AB-017.
+- `ps2recomp-zz-guest-heap.patch`: el monticulo del juego (`SetupHeap(.., -1)`/`EndOfHeap`) acababa en 0x01F00000
+  porque ahi vivian los pools HLE del runtime (paquetes y servidores RPC, TLS, modo de arranque, 0x01F00000-0x01F31000).
+  En la consola el monticulo llega hasta la pila del hilo principal (AirBlade: 0x01FF8000). AirBlade lo llena casi
+  entero en el arranque y la `malloc(0x40140)` del raster de 256x256x32 de la sombra del jugador (tick 2) fallaba
+  (`RwErrorSet(E_RW_NOMEM)`): sin raster, la sombra se dibujaba sin textura ni mezcla (PRIM 0x0B, blanco) = AB-017.
+  Ahora los pools estan en la RAM del kernel (0x80000-0xB1000, sin uso por los ELF de usuario, que cargan en
+  0x100000) y el limite es `PS2_GUEST_HEAP_HARD_LIMIT` = 0x01F80000 (512 KB para la pila principal y las de callbacks
+  del runtime, que bajan desde el final de la RAM). Toca una cabecera: recompila todo (~13 min).
 
 Arreglos del juego (sin parche, en `runner/blade_overrides.cpp`):
 - Cache de texturas de RenderWare (0x1F39E0): en el modo de video 38 (640x512, entrelazado + FSAA) el driver calcula el
@@ -482,6 +496,21 @@ Detalle y evidencia en `docs/` (`QA_REPORT.md`, `AIRBLADE_STATUS.md`, `AIRBLADE_
   se dibuja aparece una mancha blanca opaca en el suelo alrededor de el (ticks 2300, 3000, 3100, 3160, 3900); no sale de
   los atomicos que pasan por 0x200740 (sigue al quitar la tabla); hipotesis sin comprobar: la sombra proyectada del
   jugador, con textura o mezcla mal. Tambien sin comprobar: `MAX.S`/`MIN.S` y las comparaciones del VU con exponente 255.
+  AB-017 (2026-11-12, FIXED-BUILT, UNVERIFIED sin PNG de PCSX2 en el mismo tick): era la sombra. La sonda de pixel
+  (`PS2X_GS_PROBE` + `BLADE_GS_PROBE_TICKS`) dio triangulos PRIM 0x0B (sin TME ni ABE) de color 254,254,254,58 lanzados
+  por el VU1 con una etiqueta que arma 0x2107D0 (Im3D) desde 0x1442D0, la funcion de la sombra, que fija como textura
+  el raster de [0x2FA43C]. Ese raster (camara-textura de 256x256x32, creado en 0x131670 en el tick 2) era NULL:
+  `RwRasterCreate` fallaba con E_RW_NOMEM porque el runtime cortaba el monticulo en 0x01F00000 y el juego ya lo tenia
+  en ~0x01EFC000. Arreglo: `ps2recomp-zz-guest-heap.patch` (limite 0x01F80000, pools HLE a la RAM del kernel); ahora
+  [0x2FA43C] = 0x01ECDF40 en el tick 3. Capturas (mismo guion): `qa_out/ab004/despues/frame_003100.png` y
+  `frame_003160.png` (mancha blanca) frente a `qa_out/ab017/despues/frame_003100.png` y `frame_003160.png` (suelo
+  limpio, sombra oscura del jugador, jugador y tabla intactos). Traza de `[rts]` para 0x2107D0 y demas puentes de
+  material en `runner/blade_overrides.cpp` (con `BLADE_RT_TRACE`/`BLADE_RT_FUNCS`). Misma causa en AB-005: el panel
+  blanco del menu (tick 900) pasa a ser la columna de textos sobre el video y se van las barras blancas de la carga
+  (tick 100); resumen en `qa_out/ab017/regresion_menus.png`. Regresion frente a la corrida post-AB-004
+  (`qa_out/ab004/regresion`): RAM distinta en todos los ticks (cambian monticulo y pools, esperado), imagen igual en
+  23 de 78 puntos (cargas 150-600 y 1250-1850) y distinta en 55 (menus y partida), 0 errores; `qa/ref_det` hay que
+  regenerarla.
 - Pendiente 3: rendimiento (2026-11-11, `BLADE_STATS=1`, Mac M1 de 8 nucleos; medidas con otros procesos pesados
   compitiendo, orientativas). Menu a 50 VSync/s fijos (a ritmo real, PAL); partida del nivel 1 entre 14 y 22 VSync/s
   (antes 16 VSync/s a 60 Hz). Ya no hay espera activa: en la partida el hilo del EE esta ~100 % ocupado, ~75 % en el

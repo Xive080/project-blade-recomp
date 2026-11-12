@@ -61,7 +61,30 @@ namespace
         const uint32_t ra = GPR_U32(ctx, 31), s2 = GPR_U32(ctx, 18), s5 = GPR_U32(ctx, 21);
         const bool distCall = traceWin && gRtAddr[N] == 0x179CF0u && (ra == 0x128C78u || ra == 0x128C8Cu) &&
                               (s2 == 0xBF5350u || s5 == 0x0104F224u);
+        // AB-017: estado de primitiva de RenderWare (skyPrim_State en gp-0x7EC8: TME 0x10, ABE 0x40), raster en cache
+        // (gp-0x7870) y banderas de alfa (gp-0x7874 alfa del raster, gp-0x7878 alfa de vertice/material) antes y despues.
+        const uint32_t gp = GPR_U32(ctx, 28);
+        auto skyState = [&](const char *when)
+        {
+            std::printf("[rts] tick %llu fn=%08x %s prim=%03x raster=%08x rasA=%u vtxA=%u v0=%08x\n", gBladeQaTick, gRtAddr[N], when,
+                        readGuest32(rdram, gp - 0x7EC8u) & 0x7FFu, readGuest32(rdram, gp - 0x7870u), readGuest32(rdram, gp - 0x7874u),
+                        readGuest32(rdram, gp - 0x7878u), GPR_U32(ctx, 2));
+        };
+        if (traceWin)
+        {
+            skyState("in ");
+            if (gRtAddr[N] == 0x2107D0u)
+            {
+                const uint32_t a1 = GPR_U32(ctx, 5), a2 = GPR_U32(ctx, 6);
+                const uint32_t mesh = readGuest32(rdram, a1), mat = mesh ? readGuest32(rdram, mesh + 8u) : 0u;
+                const uint32_t tex = mat ? readGuest32(rdram, mat) : 0u, ras = tex ? readGuest32(rdram, tex) : 0u;
+                std::printf("[rts]   a0[0]=%08x a2[8]=%08x mesh=%08x mat=%08x matcol=%08x tex=%08x ras=%08x\n", readGuest32(rdram, a0),
+                            readGuest32(rdram, a2 + 8u), mesh, mat, mat ? readGuest32(rdram, mat + 4u) : 0u, tex, ras);
+            }
+        }
         gRtOrig[N](rdram, ctx, runtime);
+        if (traceWin)
+            skyState("out");
         if (distCall)
         {
             uint32_t f0b, f20b, f21b;
